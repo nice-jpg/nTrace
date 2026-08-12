@@ -49,6 +49,12 @@ Each dynamic collector owns an independent trace and does not inherit client exe
 context. The server infers parent/child relationships from host-span timing and persists
 the resulting trace tree.
 
+For every model iteration, the first trace middleware emits a host start from
+`before_model`, the last trace middleware collects the prepared state and emits the
+matching host end from `before_model`, and its `wrap_model_call` emits the LLM start/end
+pair. The UI timeline advances only when an event arrives, so idle wall-clock time does
+not continuously resize existing blocks; the next event reveals the elapsed gap.
+
 The low-level `NTrace`, `createNTraceStartMiddleware`, and `createNTraceEndMiddleware`
 exports are intended for agent-builder implementations, not for call sites invoking an
 already-built agent. The compiled agent itself remains unwrapped and privately owns its

@@ -2,47 +2,47 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-from langchain.agents.middleware.types import AgentMiddleware
+from langchain.agents.middleware.types import AgentMiddleware, AgentState, ModelRequest, ModelResponse
+from langchain_core.messages import BaseMessage
 
 from .events import (
+    current_tool_exchange,
     json_value,
     latest_output,
     normalize_token_usage,
     tool_calls,
-    tool_results,
     tools_payload,
     user_inputs,
 )
 from .trace import NTrace
 
 
-def _messages(state: Any) -> list[Any]:
-    if isinstance(state, dict):
-        return list(state.get("messages") or [])
-    return list(getattr(state, "messages", None) or [])
+def _messages(state: AgentState) -> list[BaseMessage]:
+    return list(state.get("messages") or [])
 
 
 class NTraceStartMiddleware(AgentMiddleware):
     def __init__(self, trace: NTrace) -> None:
         self.trace = trace
 
-    def before_agent(self, state: Any, runtime: Any) -> None:
+    def before_model(self, state: AgentState, runtime: Any) -> None:
         self._emit(state)
         return None
 
-    async def abefore_agent(self, state: Any, runtime: Any) -> None:
+    async def abefore_model(self, state: AgentState, runtime: Any) -> None:
         self._emit(state)
         return None
 
-    def _emit(self, state: Any) -> None:
-        binding = self.trace.begin_agent()
+    def _emit(self, state: AgentState) -> None:
+        binding, span_id = self.trace.begin_host_span()
         messages = _messages(state)
         self.trace.emit(
             sender="host",
             event_type="start",
-            span_id=binding.host_span_id,
+            span_id=span_id,
             parent_span_id=binding.parent_span_id,
             system_prompt=self.trace.system_prompt,
             user_inputs=user_inputs(messages),
@@ -55,29 +55,19 @@ class NTraceEndMiddleware(AgentMiddleware):
     def __init__(self, trace: NTrace) -> None:
         self.trace = trace
 
-    def after_agent(self, state: Any, runtime: Any) -> None:
+    def before_model(self, state: AgentState, runtime: Any) -> None:
         self._emit_host_end(state)
         return None
 
-    async def aafter_agent(self, state: Any, runtime: Any) -> None:
+    async def abefore_model(self, state: AgentState, runtime: Any) -> None:
         self._emit_host_end(state)
         return None
 
-    def wrap_model_call(self, request: Any, handler: Any) -> Any:
-        return self._wrap_model(request, handler)
-
-    async def awrap_model_call(self, request: Any, handler: Any) -> Any:
-        span_id = self.trace.next_span_id()
-        self._emit_model_start(request, span_id)
-        try:
-            response = await handler(request)
-        except Exception as error:
-            self._emit_model_error(request, span_id, error)
-            raise
-        self._emit_model_end(request, response, span_id)
-        return response
-
-    def _wrap_model(self, request: Any, handler: Any) -> Any:
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
         span_id = self.trace.next_span_id()
         self._emit_model_start(request, span_id)
         try:
@@ -88,74 +78,90 @@ class NTraceEndMiddleware(AgentMiddleware):
         self._emit_model_end(request, response, span_id)
         return response
 
-    def _emit_model_start(self, request: Any, span_id: int) -> None:
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        span_id = self.trace.next_span_id()
+        self._emit_model_start(request, span_id)
+        try:
+            response = await handler(request)
+        except Exception as error:
+            self._emit_model_error(request, span_id, error)
+            raise
+        self._emit_model_end(request, response, span_id)
+        return response
+
+    def _emit_model_start(self, request: ModelRequest, span_id: int) -> None:
         binding = self.trace.current_binding
         if binding is None:
             return
-        messages = list(getattr(request, "messages", None) or [])
-        system_prompt = getattr(request, "system_prompt", None) or getattr(request, "system_message", None)
+        messages = list(request.messages)
         self.trace.emit(
             sender="llm",
             event_type="start",
             span_id=span_id,
-            parent_span_id=binding.host_span_id,
-            system_prompt=system_prompt,
+            parent_span_id=self.trace.latest_host_span_id,
+            system_prompt=request.system_prompt,
             user_inputs=user_inputs(messages),
-            tools=tools_payload(getattr(request, "tools", None)),
-            data={"messages": json_value(messages), "model_settings": json_value(getattr(request, "model_settings", None))},
+            tools=tools_payload(request.tools),
+            data={"messages": json_value(messages), "model_settings": json_value(request.model_settings)},
         )
 
-    def _emit_model_end(self, request: Any, response: Any, span_id: int) -> None:
+    def _emit_model_end(self, request: ModelRequest, response: ModelResponse, span_id: int) -> None:
         binding = self.trace.current_binding
         if binding is None:
             return
-        request_messages = list(getattr(request, "messages", None) or [])
-        result = list(getattr(response, "result", None) or [])
+        request_messages = list(request.messages)
+        result = list(response.result)
         self.trace.emit(
             sender="llm",
             event_type="end",
             span_id=span_id,
-            parent_span_id=binding.host_span_id,
-            system_prompt=getattr(request, "system_prompt", None) or getattr(request, "system_message", None),
+            parent_span_id=self.trace.latest_host_span_id,
+            system_prompt=request.system_prompt,
             user_inputs=user_inputs(request_messages),
             output=latest_output(result),
-            tools=tools_payload(getattr(request, "tools", None)),
+            tools=tools_payload(request.tools),
             tools_called=tool_calls(result),
             token_usage=normalize_token_usage(result),
             data={"response": json_value(response)},
         )
 
-    def _emit_model_error(self, request: Any, span_id: int, error: Exception) -> None:
+    def _emit_model_error(self, request: ModelRequest, span_id: int, error: Exception) -> None:
         binding = self.trace.current_binding
         if binding is None:
             return
-        messages = list(getattr(request, "messages", None) or [])
+        messages = list(request.messages)
         self.trace.emit(
             sender="llm",
             event_type="end",
             span_id=span_id,
-            parent_span_id=binding.host_span_id,
-            system_prompt=getattr(request, "system_prompt", None) or getattr(request, "system_message", None),
+            parent_span_id=self.trace.latest_host_span_id,
+            system_prompt=request.system_prompt,
             user_inputs=user_inputs(messages),
-            tools=tools_payload(getattr(request, "tools", None)),
+            tools=tools_payload(request.tools),
             data={"error_type": type(error).__name__, "error": str(error)},
         )
 
-    def _emit_host_end(self, state: Any) -> None:
-        binding = self.trace.current_binding
-        if binding is None:
+    def _emit_host_end(self, state: AgentState) -> None:
+        host_span = self.trace.finish_host_span()
+        if host_span is None:
             return
+        binding, span_id = host_span
         messages = _messages(state)
+        calls, results = current_tool_exchange(messages)
         self.trace.emit(
             sender="host",
             event_type="end",
-            span_id=binding.host_span_id,
+            span_id=span_id,
             parent_span_id=binding.parent_span_id,
             system_prompt=self.trace.system_prompt,
             user_inputs=user_inputs(messages),
             output=latest_output(messages),
-            tools_called=tool_calls(messages),
-            tool_call_results=tool_results(messages),
+            tools_called=calls,
+            tool_call_results=results,
             data={"state": json_value(state)},
         )
 

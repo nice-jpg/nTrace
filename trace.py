@@ -16,10 +16,10 @@ class TraceBinding:
     agent_id: int
     agent_name: str
     activation_order: int
-    host_span_id: int
     session_id: str | None = None
     parent_agent_id: int | None = None
     parent_span_id: int | None = None
+    user_input_boundary: bool = False
 
 
 class NTrace:
@@ -39,12 +39,15 @@ class NTrace:
         self.trace_id: int | None = None
         self._binding: TraceBinding | None = None
         self._prepared = False
+        self._active_host_span_id: int | None = None
+        self._latest_host_span_id: int | None = None
 
     def update(
         self,
         *,
         session_id: str | None,
         resume: bool = False,
+        user_input_boundary: bool = False,
     ) -> TraceBinding:
         """Replace this agent's active trace, or retain it for a resume."""
 
@@ -59,20 +62,39 @@ class NTrace:
             agent_id=1,
             agent_name=self.agent_name,
             activation_order=1,
-            host_span_id=next_id(),
             session_id=session_id,
+            user_input_boundary=user_input_boundary,
         )
         self._prepared = True
         return self._binding
 
-    def begin_agent(self) -> TraceBinding:
-        """Consume an explicit turn update or create a fresh standalone trace."""
+    def ensure_binding(self) -> TraceBinding:
+        """Consume a turn update or create a fresh standalone trace."""
 
-        if not self._prepared:
+        if self._binding is None:
             self.update(session_id=None)
         self._prepared = False
         assert self._binding is not None
         return self._binding
+
+    def begin_host_span(self) -> tuple[TraceBinding, int]:
+        binding = self.ensure_binding()
+        span_id = next_id()
+        self._active_host_span_id = span_id
+        self._latest_host_span_id = span_id
+        return binding, span_id
+
+    def finish_host_span(self) -> tuple[TraceBinding, int] | None:
+        binding = self._binding
+        span_id = self._active_host_span_id
+        if binding is None or span_id is None:
+            return None
+        self._active_host_span_id = None
+        return binding, span_id
+
+    @property
+    def latest_host_span_id(self) -> int | None:
+        return self._latest_host_span_id
 
     def clear(self) -> None:
         """Forget the prior active trace without touching the sender connection."""
@@ -81,6 +103,8 @@ class NTrace:
         self.trace_id = None
         self._binding = None
         self._prepared = False
+        self._active_host_span_id = None
+        self._latest_host_span_id = None
 
     @property
     def current_binding(self) -> TraceBinding | None:
@@ -111,6 +135,8 @@ class NTrace:
         extra_data = json_value(data or {})
         if isinstance(extra_data, dict):
             extra_data = {"session_id": binding.session_id, **extra_data}
+            if binding.user_input_boundary:
+                extra_data["trace_boundary"] = "user_input"
         event = {
             "schema_version": SCHEMA_VERSION,
             "trace_id": binding.trace_id,

@@ -39,7 +39,7 @@ def test_storage_is_idempotent_persistent_and_assembles_out_of_order(tmp_path) -
     assert len(detail["events"]) == 2
     assert detail["spans"][0]["duration_ms"] == 2500
     assert detail["spans"][0]["output"] == "done"
-    assert detail["status"] == "completed"
+    assert detail["status"] == "running"
     assert detail["started_at"] == "2026-01-01T00:00:00.000Z"
     assert detail["updated_at"] == "2026-01-01T00:00:02.500Z"
     storage.close()
@@ -95,7 +95,32 @@ def test_server_infers_child_trace_from_active_host_timing(tmp_path) -> None:
     assert child_span["parent_span_id"] == 201
     assert child_span["data"]["source_trace_id"] == 102
     assert storage.get_trace(102) is None
-    assert detail["status"] == "completed"
+    assert detail["status"] == "running"
+    storage.close()
+
+
+def test_user_input_boundary_starts_a_new_root_while_previous_host_is_active(tmp_path) -> None:
+    storage = TraceStorage(tmp_path / "trace.sqlite3")
+    stored = storage.put_events(
+        [
+            event("start", trace_id=101, span_id=201, agent_name="conductor"),
+            event(
+                "start",
+                trace_id=102,
+                span_id=301,
+                agent_name="conductor",
+                timestamp="2026-01-01T00:00:01.000Z",
+                data={"trace_boundary": "user_input", "session_id": "same-chat"},
+            ),
+        ]
+    )
+
+    assert [item["trace_id"] for item in stored] == [101, 102]
+    assert stored[1]["agent_id"] == 1
+    assert stored[1]["parent_agent_id"] is None
+    assert stored[1]["parent_span_id"] is None
+    assert storage.get_trace(101) is not None
+    assert storage.get_trace(102) is not None
     storage.close()
 
 
@@ -132,3 +157,36 @@ def test_inferred_context_survives_storage_restart(tmp_path) -> None:
     assert stored[0]["agent_id"] == 2
     assert reopened.get_trace(101)["spans"][1]["running"] is False
     reopened.close()
+
+
+def test_server_links_child_after_parent_host_span_has_ended(tmp_path) -> None:
+    storage = TraceStorage(tmp_path / "trace.sqlite3")
+    llm_end = event(
+        "end",
+        trace_id=101,
+        span_id=202,
+        parent_span_id=201,
+        sender="llm",
+        timestamp="2026-01-01T00:00:01.000Z",
+        tools_called=[{"name": "prepare_collector", "args": {}}],
+    )
+    stored = storage.put_events(
+        [
+            event("start", trace_id=101, span_id=201),
+            event("end", trace_id=101, span_id=201, timestamp="2026-01-01T00:00:00.100Z"),
+            llm_end,
+            event(
+                "start",
+                trace_id=102,
+                span_id=301,
+                agent_name="collector",
+                timestamp="2026-01-01T00:00:01.100Z",
+            ),
+        ]
+    )
+
+    child = stored[-1]
+    assert child["trace_id"] == 101
+    assert child["agent_id"] == 2
+    assert child["parent_span_id"] == 201
+    storage.close()

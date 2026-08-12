@@ -84,6 +84,7 @@ class TraceStorage:
                     INSERT INTO traces(trace_id, started_at, updated_at, status)
                     VALUES (?, ?, ?, 'running')
                     ON CONFLICT(trace_id) DO UPDATE SET
+                        status='running',
                         started_at=CASE
                             WHEN excluded.started_at < traces.started_at THEN excluded.started_at
                             ELSE traces.started_at
@@ -138,15 +139,6 @@ class TraceStorage:
                 )
                 if cursor.rowcount:
                     stored.append(event)
-                if (
-                    event["sender"] == "host"
-                    and event["type"] == "end"
-                    and int(event["agent_id"]) == 1
-                ):
-                    self._connection.execute(
-                        "UPDATE traces SET status='completed', updated_at=? WHERE trace_id=?",
-                        (timestamp, trace_id),
-                    )
         return stored
 
     def _contextualize_event(self, raw_event: dict[str, Any]) -> dict[str, Any]:
@@ -163,23 +155,32 @@ class TraceStorage:
             (source_trace_id,),
         ).fetchone()
         if context is None:
-            parent = self._connection.execute(
-                """
-                SELECT start.trace_id, start.span_id, start.agent_id
-                FROM events AS start
-                LEFT JOIN events AS finish
-                  ON finish.trace_id=start.trace_id
-                 AND finish.span_id=start.span_id
-                 AND finish.event_type='end'
-                WHERE start.sender='host'
-                  AND start.event_type='start'
-                  AND start.timestamp <= ?
-                  AND finish.span_id IS NULL
-                ORDER BY start.timestamp DESC, start.rowid DESC
-                LIMIT 1
-                """,
-                (timestamp,),
-            ).fetchone()
+            raw_data = raw_event.get("data")
+            starts_user_turn = (
+                isinstance(raw_data, dict)
+                and raw_data.get("trace_boundary") == "user_input"
+            )
+            parent = None
+            if not starts_user_turn:
+                parent = self._connection.execute(
+                    """
+                    SELECT start.trace_id, start.span_id, start.agent_id
+                    FROM events AS start
+                    LEFT JOIN events AS finish
+                      ON finish.trace_id=start.trace_id
+                     AND finish.span_id=start.span_id
+                     AND finish.event_type='end'
+                    WHERE start.sender='host'
+                      AND start.event_type='start'
+                      AND start.timestamp <= ?
+                      AND finish.span_id IS NULL
+                    ORDER BY start.timestamp DESC, start.rowid DESC
+                    LIMIT 1
+                    """,
+                    (timestamp,),
+                ).fetchone()
+                if parent is None:
+                    parent = self._latest_tool_call_parent(timestamp)
             if parent is None:
                 root_trace_id = source_trace_id
                 parent_span_id = None
@@ -233,6 +234,34 @@ class TraceStorage:
         if event.get("sender") == "host":
             event["parent_span_id"] = context["parent_span_id"]
         return event
+
+    def _latest_tool_call_parent(self, timestamp: str) -> dict[str, int] | None:
+        """Find the host span whose model response most recently started a tool."""
+
+        rows = self._connection.execute(
+            """
+            SELECT event.trace_id, event.agent_id, event.payload_json
+            FROM events AS event
+            JOIN traces AS trace ON trace.trace_id=event.trace_id
+            WHERE event.sender='llm'
+              AND event.event_type='end'
+              AND event.timestamp <= ?
+              AND trace.status='running'
+            ORDER BY event.timestamp DESC, event.rowid DESC
+            LIMIT 50
+            """,
+            (timestamp,),
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            parent_span_id = payload.get("parent_span_id")
+            if payload.get("tools_called") and parent_span_id is not None:
+                return {
+                    "trace_id": int(row["trace_id"]),
+                    "span_id": int(parent_span_id),
+                    "agent_id": int(row["agent_id"]),
+                }
+        return None
 
     def list_traces(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:

@@ -9,6 +9,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from langchain_core.tools import BaseTool
+
 SCHEMA_VERSION = 1
 
 
@@ -67,12 +69,37 @@ def message_content(message: Any) -> Any:
     return message.get("content") if isinstance(message, Mapping) else getattr(message, "content", None)
 
 
+def _message_field(message: Any, field: str) -> Any:
+    return message.get(field) if isinstance(message, Mapping) else getattr(message, field, None)
+
+
+def _function_call(call: Any) -> dict[str, Any]:
+    payload = call if isinstance(call, Mapping) else {}
+    return {
+        "type": "function_call",
+        "name": json_value(payload.get("name")),
+        "arguments": json_value(payload.get("arguments", payload.get("args"))),
+    }
+
+
 def user_inputs(messages: Sequence[Any]) -> list[Any]:
-    return [
-        json_value(message_content(message))
-        for message in messages
-        if message_role(message).lower() in {"user", "human"}
-    ]
+    """Serialize model inputs as typed Responses-style items."""
+
+    inputs: list[Any] = []
+    for message in messages:
+        content = message_content(message)
+        role = message_role(message)
+        if content not in (None, "", []):
+            inputs.append({"type": "message", "role": role, "content": json_value(content)})
+
+        additional_kwargs = _message_field(message, "additional_kwargs")
+        if isinstance(additional_kwargs, Mapping):
+            for reasoning in additional_kwargs.get("reasoning_items") or []:
+                inputs.append(json_value(reasoning))
+
+        for call in _message_field(message, "tool_calls") or []:
+            inputs.append(_function_call(call))
+    return inputs
 
 
 def tool_calls(messages: Sequence[Any]) -> list[Any]:
@@ -86,6 +113,36 @@ def tool_calls(messages: Sequence[Any]) -> list[Any]:
 
 def tool_results(messages: Sequence[Any]) -> list[Any]:
     return [json_value(message) for message in messages if message_role(message).lower() == "tool"]
+
+
+def current_tool_exchange(messages: Sequence[Any]) -> tuple[list[Any], list[Any]]:
+    """Return only the most recent tool-call turn and its matching results."""
+
+    call_index: int | None = None
+    calls: list[Any] = []
+    for index in range(len(messages) - 1, -1, -1):
+        raw_calls = _message_field(messages[index], "tool_calls") or []
+        if raw_calls:
+            call_index = index
+            calls = list(json_value(raw_calls))
+            break
+    if call_index is None:
+        return [], []
+
+    call_ids = {
+        str(call.get("id"))
+        for call in calls
+        if isinstance(call, Mapping) and call.get("id") is not None
+    }
+    results: list[Any] = []
+    for message in messages[call_index + 1:]:
+        if message_role(message).lower() != "tool":
+            continue
+        result = json_value(message)
+        result_id = _message_field(message, "tool_call_id")
+        if not call_ids or result_id is None or str(result_id) in call_ids:
+            results.append(result)
+    return calls, results
 
 
 def latest_output(messages: Sequence[Any]) -> Any:
@@ -123,12 +180,19 @@ def normalize_token_usage(messages: Sequence[Any]) -> dict[str, Any]:
     return {}
 
 
-def tools_payload(tools: Sequence[Any] | None) -> list[Any]:
-    return [json_value(tool) for tool in (tools or [])]
+def tools_payload(tools: Sequence[BaseTool] | None) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": json_value(tool.name),
+            "description": json_value(tool.description),
+        }
+        for tool in (tools or [])
+    ]
 
 
 __all__ = [
     "SCHEMA_VERSION",
+    "current_tool_exchange",
     "json_value",
     "latest_output",
     "normalize_token_usage",

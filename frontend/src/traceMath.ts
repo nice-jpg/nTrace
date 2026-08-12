@@ -46,17 +46,140 @@ export function upsertEvent(events: TraceEvent[], incoming: TraceEvent): TraceEv
   return copy
 }
 
+export function latestEventTime(events: TraceEvent[], fallbackMs: number): number {
+  return events.reduce((latest, event) => {
+    const timestamp = Date.parse(event.timestamp)
+    return Number.isFinite(timestamp) ? Math.max(latest, timestamp) : latest
+  }, fallbackMs)
+}
+
+export function centeredZoomScrollLeft({
+  scrollLeft,
+  clientWidth,
+  labelWidth,
+  oldPixelsPerMs,
+  newPixelsPerMs,
+  durationMs,
+  newStageWidth,
+}: {
+  scrollLeft: number
+  clientWidth: number
+  labelWidth: number
+  oldPixelsPerMs: number
+  newPixelsPerMs: number
+  durationMs: number
+  newStageWidth: number
+}): number {
+  const viewportCenter = scrollLeft + clientWidth / 2
+  const centerTime = Math.min(
+    durationMs,
+    Math.max(0, (viewportCenter - labelWidth) / Math.max(oldPixelsPerMs, Number.EPSILON)),
+  )
+  const anchoredCenter = labelWidth + centerTime * newPixelsPerMs
+  return Math.min(
+    Math.max(0, newStageWidth - clientWidth),
+    Math.max(0, anchoredCenter - clientWidth / 2),
+  )
+}
+
+export function clampDrawerHeight(height: number, viewportHeight: number): number {
+  return Math.min(Math.max(190, height), Math.max(190, viewportHeight - 72))
+}
+
 export function tokenTotal(span: TraceSpan): number | null {
   const raw = span.token_usage?.total_tokens
   const parsed = typeof raw === 'number' ? raw : Number(raw)
   return Number.isFinite(parsed) ? Math.max(0, parsed) : null
 }
 
-export function tokenColor(total: number | null, maximum: number): string {
-  if (total === null) return 'hsl(215 12% 42%)'
-  const ratio = maximum > 0 ? Math.log1p(total) / Math.log1p(maximum) : 0
-  const lightness = 70 - Math.min(1, ratio) * 36
-  return `hsl(263 78% ${lightness.toFixed(1)}%)`
+function numericTokenField(value: unknown): number {
+  const parsed = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(parsed) ? Math.max(0, parsed) : 0
+}
+
+export interface TokenCostBreakdown {
+  inputTokens: number
+  uncachedInputTokens: number
+  outputTokens: number
+  cachedTokens: number
+  weightedCost: number
+}
+
+export function tokenCostBreakdown(usage: Record<string, unknown> | null | undefined): TokenCostBreakdown {
+  const source = usage ?? {}
+  const details = typeof source.details === 'object' && source.details !== null
+    ? source.details as Record<string, unknown>
+    : {}
+  const inputDetails = typeof details.input_token_details === 'object' && details.input_token_details !== null
+    ? details.input_token_details as Record<string, unknown>
+    : typeof source.input_token_details === 'object' && source.input_token_details !== null
+      ? source.input_token_details as Record<string, unknown>
+      : {}
+  const inputTokens = numericTokenField(source.input_tokens ?? details.input_tokens)
+  const outputTokens = numericTokenField(source.output_tokens ?? details.output_tokens)
+  const cachedTokens = Math.min(inputTokens, numericTokenField(inputDetails.cached_tokens))
+  const uncachedInputTokens = inputTokens - cachedTokens
+  return {
+    inputTokens,
+    uncachedInputTokens,
+    outputTokens,
+    cachedTokens,
+    weightedCost: outputTokens * 100 + cachedTokens + uncachedInputTokens * 50,
+  }
+}
+
+export function tokenCost(span: TraceSpan): number | null {
+  if (!span.token_usage || Object.keys(span.token_usage).length === 0) return null
+  return tokenCostBreakdown(span.token_usage).weightedCost
+}
+
+export function decodeEscapedText(value: string): string {
+  return value.replace(/\\(u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|n|r|t|b|f|v|0|\\|"|')/g, (match, escape: string) => {
+    if (escape.startsWith('u{')) return String.fromCodePoint(Number.parseInt(escape.slice(2, -1), 16))
+    if (escape.startsWith('u')) return String.fromCharCode(Number.parseInt(escape.slice(1), 16))
+    const values: Record<string, string> = {
+      n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', v: '\v', 0: '\0', '\\': '\\', '"': '"', "'": "'",
+    }
+    return values[escape] ?? match
+  })
+}
+
+export function formatTickLabel(milliseconds: number, durationMs: number): string {
+  if (durationMs < 1_000) return `${milliseconds.toFixed(1)}ms`
+  if (durationMs < 10_000) return `${(milliseconds / 1_000).toFixed(3)}s`
+  if (durationMs < 60_000) return `${(milliseconds / 1_000).toFixed(3)}s`
+  if (durationMs < 3_600_000) {
+    const minutes = Math.floor(milliseconds / 60_000)
+    const precision = 3
+    const seconds = ((milliseconds % 60_000) / 1_000).toFixed(precision).padStart(precision + 3, '0')
+    return `${minutes}:${seconds}`
+  }
+  const hours = Math.floor(milliseconds / 3_600_000)
+  const minutes = Math.floor((milliseconds % 3_600_000) / 60_000)
+  const seconds = Math.floor((milliseconds % 60_000) / 1_000)
+  return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+export function tokenColor(weightedCost: number | null): string {
+  if (weightedCost === null) return 'hsl(215 12% 42%)'
+  const costInThousands = Math.max(0, weightedCost) / 1_000
+  const ratio = costInThousands <= 300
+    ? Math.pow(costInThousands / 300, 0.45) * 0.92
+    : 0.92 + Math.min(1, (costInThousands - 300) / 700) * 0.08
+  const lightness = 80 - ratio * 59
+  const saturation = 62 + ratio * 28
+  return `hsl(263 ${saturation.toFixed(1)}% ${lightness.toFixed(1)}%)`
+}
+
+export function childConnectorSpans(spans: TraceSpan[]): TraceSpan[] {
+  const firstByChild = new Map<number, TraceSpan>()
+  for (const span of [...spans].sort(
+    (a, b) => Date.parse(a.started_at) - Date.parse(b.started_at) || a.span_id - b.span_id,
+  )) {
+    if (span.sender !== 'host' || span.parent_span_id === null || span.parent_agent_id !== 1) continue
+    if (!firstByChild.has(span.agent_id)) firstByChild.set(span.agent_id, span)
+  }
+  return [...firstByChild.values()]
 }
 
 export interface SpanLayout {
@@ -69,13 +192,13 @@ export interface SpanLayout {
 export function layoutSpan(
   span: TraceSpan,
   startMs: number,
-  nowMs: number,
+  timelineEndMs: number,
   pixelsPerMs: number,
   viewportWidth: number,
   hasChild: boolean,
 ): SpanLayout {
   const spanStart = Date.parse(span.started_at)
-  const spanEnd = span.ended_at ? Date.parse(span.ended_at) : nowMs
+  const spanEnd = span.ended_at ? Date.parse(span.ended_at) : timelineEndMs
   const naturalWidth = Math.max(18, (Math.max(spanStart, spanEnd) - spanStart) * pixelsPerMs)
   const cap = Math.max(48, viewportWidth / 3)
   const width = hasChild ? naturalWidth : Math.min(naturalWidth, cap)

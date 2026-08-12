@@ -1,14 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { PointerEvent as ReactPointerEvent } from 'react'
 import { fetchTrace, fetchTraces, openTraceStream } from './api'
 import {
   AGENT_HEIGHT,
   LABEL_WIDTH,
   RULER_HEIGHT,
   assembleSpans,
+  centeredZoomScrollLeft,
+  childConnectorSpans,
+  clampDrawerHeight,
+  decodeEscapedText,
   formatDuration,
+  formatTickLabel,
+  latestEventTime,
   layoutSpan,
   tokenColor,
-  tokenTotal,
+  tokenCost,
+  tokenCostBreakdown,
   upsertEvent,
 } from './traceMath'
 import type { AgentSummary, TraceDetail, TraceEvent, TraceSpan, TraceSummary } from './types'
@@ -178,7 +186,6 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
   const [viewportWidth, setViewportWidth] = useState(900)
   const [zoom, setZoom] = useState(1)
   const [follow, setFollow] = useState(true)
-  const [now, setNow] = useState(Date.now())
 
   useEffect(() => {
     const element = viewportRef.current
@@ -187,32 +194,83 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
     observer.observe(element)
     return () => observer.disconnect()
   }, [])
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 500)
-    return () => window.clearInterval(timer)
-  }, [])
-
   const agents = useMemo(() => [...trace.agents].sort((a, b) => a.activation_order - b.activation_order), [trace.agents])
   const spans = trace.spans
   const startMs = Math.min(...spans.map((span) => Date.parse(span.started_at)), Date.parse(trace.started_at))
-  const latestMs = Math.max(nowIfRunning(trace, now), ...spans.map((span) => span.ended_at ? Date.parse(span.ended_at) : now))
+  const latestMs = latestEventTime(trace.events, startMs)
   const durationMs = Math.max(1_000, latestMs - startMs)
   const contentViewport = Math.max(320, viewportWidth - LABEL_WIDTH)
   const fitPixelsPerMs = contentViewport / durationMs
-  const pixelsPerMs = Math.max(0.002, fitPixelsPerMs * zoom)
+  const basePixelsPerMs = Math.max(0.01, fitPixelsPerMs)
+  const pixelsPerMs = basePixelsPerMs * zoom
   const canvasWidth = Math.max(contentViewport, durationMs * pixelsPerMs + 80)
+  const connectorSpans = useMemo(() => childConnectorSpans(spans), [spans])
   const childParentIds = useMemo(() => new Set(
-    spans.filter((span) => span.sender === 'host' && span.parent_span_id !== null).map((span) => span.parent_span_id!),
+    connectorSpans.map((span) => span.parent_span_id!),
+  ), [connectorSpans])
+  const eventOrder = useMemo(() => new Map(
+    [...spans]
+      .sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at) || a.span_id - b.span_id)
+      .map((span, index) => [span.span_id, index + 1]),
   ), [spans])
-  const maxTokens = Math.max(0, ...spans.filter((span) => span.sender === 'llm').map((span) => tokenTotal(span) ?? 0))
+  const zoomAtCenter = useCallback((direction: 'in' | 'out') => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    const nextZoom = direction === 'in'
+      ? Math.min(24, zoom * 1.35)
+      : Math.max(0.5, zoom / 1.35)
+    if (nextZoom === zoom) return
+    const nextPixelsPerMs = basePixelsPerMs * nextZoom
+    const nextCanvasWidth = Math.max(contentViewport, durationMs * nextPixelsPerMs + 80)
+    const nextScrollLeft = centeredZoomScrollLeft({
+      scrollLeft: viewport.scrollLeft,
+      clientWidth: viewport.clientWidth,
+      labelWidth: LABEL_WIDTH,
+      oldPixelsPerMs: pixelsPerMs,
+      newPixelsPerMs: nextPixelsPerMs,
+      durationMs,
+      newStageWidth: nextCanvasWidth + LABEL_WIDTH,
+    })
+    setFollow(false)
+    setZoom(nextZoom)
+    window.requestAnimationFrame(() => {
+      if (viewportRef.current) viewportRef.current.scrollLeft = nextScrollLeft
+    })
+  }, [basePixelsPerMs, contentViewport, durationMs, pixelsPerMs, zoom])
+
+  const panTimeline = useCallback((direction: 'left' | 'right') => {
+    const viewport = viewportRef.current
+    if (!viewport) return
+    setFollow(false)
+    viewport.scrollBy({
+      left: (direction === 'left' ? -1 : 1) * Math.max(120, viewport.clientWidth * 0.24),
+      behavior: 'smooth',
+    })
+  }, [])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      if (target?.matches('input, textarea, select, [contenteditable="true"]') || event.metaKey || event.ctrlKey || event.altKey) return
+      if (event.code === 'KeyW') zoomAtCenter('in')
+      else if (event.code === 'KeyS') zoomAtCenter('out')
+      else if (event.code === 'KeyA') panTimeline('left')
+      else if (event.code === 'KeyD') panTimeline('right')
+      else return
+      event.preventDefault()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [panTimeline, zoomAtCenter])
 
   useEffect(() => {
     if (follow && viewportRef.current) viewportRef.current.scrollLeft = viewportRef.current.scrollWidth
-  }, [follow, spans.length, now])
+  }, [follow, spans.length, latestMs])
 
-  const ticks = Array.from({ length: 9 }, (_, index) => ({
-    left: (canvasWidth - 80) * index / 8,
-    elapsed: durationMs * index / 8,
+  const tickSegments = Math.max(8, Math.min(64, Math.floor((canvasWidth - 80) / 108)))
+  const ticks = Array.from({ length: tickSegments + 1 }, (_, index) => ({
+    left: (canvasWidth - 80) * index / tickSegments,
+    elapsed: durationMs * index / tickSegments,
   }))
 
   return (
@@ -223,15 +281,18 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
           <span><i className="legend-llm" />LLM call · depth = tokens</span>
         </div>
         <div className="timeline-actions">
+          <span className="key-hint"><kbd>W</kbd><kbd>S</kbd> zoom · <kbd>A</kbd><kbd>D</kbd> move</span>
           <button className={follow ? 'active' : ''} onClick={() => setFollow((value) => !value)}>Live follow</button>
-          <button onClick={() => setZoom((value) => Math.max(0.5, value / 1.35))}>−</button>
+          <button onClick={() => zoomAtCenter('out')} aria-label="Zoom out around viewport center">−</button>
           <span>{Math.round(zoom * 100)}%</span>
-          <button onClick={() => setZoom((value) => Math.min(24, value * 1.35))}>+</button>
+          <button onClick={() => zoomAtCenter('in')} aria-label="Zoom in around viewport center">+</button>
         </div>
       </div>
       <div
         className="timeline-viewport"
         ref={viewportRef}
+        tabIndex={0}
+        aria-label="Trace timeline. W and S zoom; A and D move horizontally."
         onScroll={() => {
           const element = viewportRef.current
           if (element && element.scrollWidth - element.scrollLeft - element.clientWidth > 48) setFollow(false)
@@ -240,9 +301,9 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
         <div className="timeline-stage" style={{ width: canvasWidth + LABEL_WIDTH, height: RULER_HEIGHT + agents.length * AGENT_HEIGHT }}>
           <div className="ruler-corner">AGENT / SOURCE</div>
           <div className="time-ruler" style={{ left: LABEL_WIDTH, width: canvasWidth }}>
-            {ticks.map((tick) => <div className="tick" key={tick.left} style={{ left: tick.left }}><span>{formatTick(tick.elapsed)}</span></div>)}
+            {ticks.map((tick) => <div className="tick" key={tick.left} style={{ left: tick.left }}><span>{formatTickLabel(tick.elapsed, durationMs)}</span></div>)}
           </div>
-          <ConnectorLayer agents={agents} spans={spans} startMs={startMs} pixelsPerMs={pixelsPerMs} width={canvasWidth} />
+          <ConnectorLayer agents={agents} spans={spans} connectors={connectorSpans} startMs={startMs} pixelsPerMs={pixelsPerMs} width={canvasWidth} />
           {agents.map((agent, agentIndex) => (
             <AgentRows
               key={agent.agent_id}
@@ -250,11 +311,11 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
               index={agentIndex}
               spans={spans.filter((span) => span.agent_id === agent.agent_id)}
               startMs={startMs}
-              now={now}
+              timelineEndMs={latestMs}
               pixelsPerMs={pixelsPerMs}
               canvasWidth={canvasWidth}
               viewportWidth={contentViewport}
-              maxTokens={maxTokens}
+              eventOrder={eventOrder}
               childParentIds={childParentIds}
               selectedSpanId={selectedSpanId}
               onSelectSpan={onSelectSpan}
@@ -266,16 +327,16 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
   )
 }
 
-function AgentRows({ agent, index, spans, startMs, now, pixelsPerMs, canvasWidth, viewportWidth, maxTokens, childParentIds, selectedSpanId, onSelectSpan }: {
+function AgentRows({ agent, index, spans, startMs, timelineEndMs, pixelsPerMs, canvasWidth, viewportWidth, eventOrder, childParentIds, selectedSpanId, onSelectSpan }: {
   agent: AgentSummary
   index: number
   spans: TraceSpan[]
   startMs: number
-  now: number
+  timelineEndMs: number
   pixelsPerMs: number
   canvasWidth: number
   viewportWidth: number
-  maxTokens: number
+  eventOrder: Map<number, number>
   childParentIds: Set<number>
   selectedSpanId: number | null
   onSelectSpan: (span: TraceSpan) => void
@@ -291,8 +352,9 @@ function AgentRows({ agent, index, spans, startMs, now, pixelsPerMs, canvasWidth
           <span className="lane-name">{sender}</span>
           {spans.filter((span) => span.sender === sender).map((span, spanIndex) => {
             const hasChild = childParentIds.has(span.span_id)
-            const layout = layoutSpan(span, startMs, now, pixelsPerMs, viewportWidth, hasChild)
-            const total = tokenTotal(span)
+            const layout = layoutSpan(span, startMs, timelineEndMs, pixelsPerMs, viewportWidth, hasChild)
+            const order = eventOrder.get(span.span_id) ?? spanIndex + 1
+            const cost = sender === 'llm' ? tokenCost(span) : 0
             return (
               <button
                 key={span.span_id}
@@ -300,13 +362,13 @@ function AgentRows({ agent, index, spans, startMs, now, pixelsPerMs, canvasWidth
                 style={{
                   left: layout.left,
                   width: layout.width,
-                  background: sender === 'llm' ? tokenColor(total, maxTokens) : undefined,
-                  zIndex: spanIndex + 2,
+                  background: sender === 'llm' ? tokenColor(cost) : undefined,
                 }}
                 onClick={() => onSelectSpan(span)}
-                title={`${sender.toUpperCase()} · ${formatDuration(span.duration_ms)}`}
+                title={`#${order} · ${sender.toUpperCase()} · ${formatPreciseTime(span.started_at)} · ${formatDuration(span.duration_ms)}`}
               >
-                <span className="block-title">{sender === 'llm' ? llmLabel(span) : agent.agent_name}</span>
+                <span className="block-order">#{String(order).padStart(2, '0')}</span>
+                {sender === 'llm' && <span className="block-title">{llmLabel(span)}</span>}
                 <span className="block-duration">{formatDuration(span.duration_ms)}</span>
                 {layout.clipped && <b className="clip-mark">//</b>}
               </button>
@@ -318,15 +380,15 @@ function AgentRows({ agent, index, spans, startMs, now, pixelsPerMs, canvasWidth
   )
 }
 
-function ConnectorLayer({ agents, spans, startMs, pixelsPerMs, width }: {
+function ConnectorLayer({ agents, spans, connectors, startMs, pixelsPerMs, width }: {
   agents: AgentSummary[]
   spans: TraceSpan[]
+  connectors: TraceSpan[]
   startMs: number
   pixelsPerMs: number
   width: number
 }) {
   const agentIndex = new Map(agents.map((agent, index) => [agent.agent_id, index]))
-  const connectors = spans.filter((span) => span.sender === 'host' && span.parent_span_id !== null)
   return (
     <svg className="connector-layer" style={{ left: LABEL_WIDTH, top: RULER_HEIGHT, width, height: agents.length * AGENT_HEIGHT }}>
       {connectors.map((span) => {
@@ -345,16 +407,58 @@ function ConnectorLayer({ agents, spans, startMs, pixelsPerMs, width }: {
 
 function DetailDrawer({ span, onClose }: { span: TraceSpan; onClose: () => void }) {
   const [copied, setCopied] = useState(false)
+  const [height, setHeight] = useState(() => clampDrawerHeight(Math.min(window.innerHeight * 0.46, 480), window.innerHeight))
+  const dragRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null)
   const raw = JSON.stringify(span, null, 2)
   const copy = async () => {
     await navigator.clipboard.writeText(raw)
     setCopied(true)
     window.setTimeout(() => setCopied(false), 1_200)
   }
+  useEffect(() => {
+    const onResize = () => setHeight((current) => clampDrawerHeight(current, window.innerHeight))
+    window.addEventListener('resize', onResize)
+    return () => {
+      window.removeEventListener('resize', onResize)
+      document.body.classList.remove('resizing-drawer')
+    }
+  }, [])
+  const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    dragRef.current = { pointerId: event.pointerId, startY: event.clientY, startHeight: height }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    document.body.classList.add('resizing-drawer')
+    event.preventDefault()
+  }
+  const resize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    setHeight(clampDrawerHeight(drag.startHeight + drag.startY - event.clientY, window.innerHeight))
+  }
+  const stopResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (dragRef.current?.pointerId !== event.pointerId) return
+    dragRef.current = null
+    document.body.classList.remove('resizing-drawer')
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+  }
   return (
-    <aside className="detail-drawer">
-      <div className="drawer-handle" />
-      <header>
+    <aside className="detail-drawer" style={{ height }}>
+      <div
+        className="drawer-resizer"
+        role="separator"
+        aria-label="Resize trace details"
+        aria-orientation="horizontal"
+        tabIndex={0}
+        onPointerDown={startResize}
+        onPointerMove={resize}
+        onPointerUp={stopResize}
+        onPointerCancel={stopResize}
+        onKeyDown={(event) => {
+          if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return
+          setHeight((current) => clampDrawerHeight(current + (event.key === 'ArrowUp' ? 32 : -32), window.innerHeight))
+          event.preventDefault()
+        }}
+      ><span /></div>
+      <header className="drawer-header">
         <div>
           <span className={`sender-chip ${span.sender}`}>{span.sender}</span>
           <h2>{span.agent_name} <small>span #{shortId(span.span_id)}</small></h2>
@@ -366,22 +470,102 @@ function DetailDrawer({ span, onClose }: { span: TraceSpan; onClose: () => void 
       </header>
       <div className="drawer-summary">
         <Metric label="Duration" value={formatDuration(span.duration_ms)} />
-        <Metric label="Started" value={new Date(span.started_at).toLocaleTimeString()} />
+        <Metric label="Started" value={formatPreciseTime(span.started_at)} />
         <Metric label="Status" value={span.running ? 'Running' : 'Complete'} />
-        {span.sender === 'llm' && <Metric label="Tokens" value={String(tokenTotal(span) ?? '—')} />}
+        {span.sender === 'llm' && <Metric label="Weighted cost" value={tokenCost(span)?.toLocaleString() ?? '—'} />}
       </div>
       <div className="drawer-grid">
         <JsonSection title="System prompt" value={span.system_prompt} wide />
-        <JsonSection title="User inputs" value={span.user_inputs} />
+        <UserInputsSection inputs={span.user_inputs} />
         <JsonSection title="Output" value={span.output} />
         <JsonSection title="Tools" value={span.tools} />
         <JsonSection title="Tools called" value={span.tools_called} />
-        <JsonSection title="Tool call results" value={span.tool_call_results} />
-        <JsonSection title="Token usage" value={span.token_usage} />
+        {span.sender === 'host' && <JsonSection title="Tool call results" value={span.tool_call_results} />}
+        <TokenUsageSection usage={span.token_usage} />
         <JsonSection title="Additional data" value={span.data} wide />
       </div>
     </aside>
   )
+}
+
+export function UserInputsSection({ inputs }: { inputs: unknown[] }) {
+  return (
+    <details className="user-inputs-section wide" open>
+      <summary>User inputs <span>{inputs.length}</span></summary>
+      <div className="user-input-list">
+        {inputs.length === 0 && <div className="detail-empty">No user inputs</div>}
+        {inputs.map((input, index) => (
+          <article className="user-input-item" key={index}>
+            <header>
+              <span>Input {String(index + 1).padStart(2, '0')}</span>
+              <b>{inputLabel(input)}</b>
+            </header>
+            <InputContent input={input} />
+          </article>
+        ))}
+      </div>
+    </details>
+  )
+}
+
+function InputContent({ input }: { input: unknown }) {
+  const item = inputRecord(input)
+  if (item?.type === 'function_call') {
+    return <div className="function-call-input">
+      <div><span>Name</span><strong>{formatValue(item.name)}</strong></div>
+      <div><span>Arguments</span><pre>{decodeEscapedText(formatValue(item.arguments))}</pre></div>
+    </div>
+  }
+  if (item?.type === 'reasoning') {
+    return <pre>{decodeEscapedText(reasoningText(item.summary))}</pre>
+  }
+  const content = item?.type === 'message' ? item.content : input
+  return <pre>{decodeEscapedText(typeof content === 'string' ? content : formatValue(content))}</pre>
+}
+
+function inputRecord(input: unknown): Record<string, unknown> | null {
+  return typeof input === 'object' && input !== null && !Array.isArray(input)
+    ? input as Record<string, unknown>
+    : null
+}
+
+function inputLabel(input: unknown): string {
+  const item = inputRecord(input)
+  const type = typeof item?.type === 'string' ? item.type : 'message'
+  const role = type === 'message' && typeof item?.role === 'string' ? ` · ${item.role}` : ''
+  return `${type}${role}`
+}
+
+function reasoningText(summary: unknown): string {
+  if (Array.isArray(summary)) {
+    return summary.map((item) => {
+      const record = inputRecord(item)
+      return typeof record?.text === 'string' ? record.text : formatValue(item)
+    }).join('\n')
+  }
+  const record = inputRecord(summary)
+  return typeof record?.text === 'string' ? record.text : formatValue(summary)
+}
+
+function TokenUsageSection({ usage }: { usage: Record<string, unknown> }) {
+  const cost = tokenCostBreakdown(usage)
+  return (
+    <details className="token-usage-section wide" open>
+      <summary>Token usage</summary>
+      <div className="token-focus-grid">
+        <TokenMetric label="Uncached input tokens" value={cost.uncachedInputTokens} tone="input" />
+        <TokenMetric label="Output tokens" value={cost.outputTokens} tone="output" />
+        <TokenMetric label="Cached tokens" value={cost.cachedTokens} tone="cached" />
+        <TokenMetric label="Weighted cost" value={cost.weightedCost} tone="cost" />
+      </div>
+      <div className="token-formula">output × 100 + cached + uncached input × 50</div>
+      <pre>{formatValue(usage)}</pre>
+    </details>
+  )
+}
+
+function TokenMetric({ label, value, tone }: { label: string; value: number; tone: string }) {
+  return <div className={`token-metric ${tone}`}><span>{label}</span><strong>{value.toLocaleString()}</strong></div>
 }
 
 function JsonSection({ title, value, wide = false }: { title: string; value: unknown; wide?: boolean }) {
@@ -417,7 +601,7 @@ function mergeLiveEvent(detail: TraceDetail, event: TraceEvent): TraceDetail {
     agents,
     spans: assembleSpans(events),
     updated_at: event.timestamp,
-    status: event.sender === 'host' && event.type === 'end' && event.agent_id === 1 ? 'completed' : detail.status,
+    status: detail.status,
   }
 }
 
@@ -426,22 +610,18 @@ function updateTraceSummaries(current: TraceSummary[], event: TraceEvent): Trace
   const next: TraceSummary = existing ? {
     ...existing,
     updated_at: event.timestamp,
-    status: event.sender === 'host' && event.type === 'end' && event.agent_id === 1 ? 'completed' : existing.status,
+    status: existing.status,
     agent_count: Math.max(existing.agent_count, event.agent_id),
     span_count: existing.span_count + (event.type === 'start' ? 1 : 0),
   } : {
     trace_id: event.trace_id,
     started_at: event.timestamp,
     updated_at: event.timestamp,
-    status: event.sender === 'host' && event.type === 'end' && event.agent_id === 1 ? 'completed' : 'running',
+    status: 'running',
     agent_count: event.agent_id,
     span_count: 1,
   }
   return [next, ...current.filter((trace) => trace.trace_id !== event.trace_id)]
-}
-
-function nowIfRunning(trace: TraceDetail, now: number): number {
-  return trace.status === 'running' ? now : Date.parse(trace.updated_at)
 }
 
 function llmLabel(span: TraceSpan): string {
@@ -455,10 +635,12 @@ function shortId(value: number): string {
   return text.length > 8 ? text.slice(-8) : text
 }
 
-function formatTick(milliseconds: number): string {
-  if (milliseconds < 1_000) return `${Math.round(milliseconds)}ms`
-  if (milliseconds < 60_000) return `${(milliseconds / 1_000).toFixed(1)}s`
-  return `${(milliseconds / 60_000).toFixed(1)}m`
+function formatPreciseTime(value: string): string {
+  const date = new Date(value)
+  const time = date.toLocaleTimeString(undefined, {
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  })
+  return `${time}.${String(date.getMilliseconds()).padStart(3, '0')}`
 }
 
 function formatValue(value: unknown): string {

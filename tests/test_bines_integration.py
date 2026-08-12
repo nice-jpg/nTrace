@@ -31,13 +31,16 @@ def test_real_bines_runtime_emits_host_and_llm_spans() -> None:
     assert result.output == "done"
     assert [(event["sender"], event["type"]) for event in client.events] == [
         ("host", "start"),
+        ("host", "end"),
         ("llm", "start"),
         ("llm", "end"),
-        ("host", "end"),
     ]
     assert len({event["trace_id"] for event in client.events}) == 1
-    assert client.events[0]["user_inputs"] == ["hello"]
+    assert client.events[0]["user_inputs"] == [
+        {"type": "message", "role": "human", "content": "hello"}
+    ]
     assert client.events[0]["data"]["session_id"] == "trace-test"
+    assert client.events[0]["data"]["trace_boundary"] == "user_input"
     assert runtime.agent._ntrace.trace_id == client.events[0]["trace_id"]
 
 
