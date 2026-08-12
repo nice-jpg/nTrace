@@ -9,7 +9,7 @@ timeline in React.
 Install the Python service dependencies:
 
 ```bash
-/Users/nice/Env/anaconda3/envs/bines/bin/python -m pip install -r nTrace/requirements.txt
+python -m pip install -r nTrace/requirements.txt
 ```
 
 Build the frontend once, then start the combined server:
@@ -44,10 +44,13 @@ HTTP and WebSocket traffic to the Python server.
 Trace construction is internal to each Bines agent.
 Callers create and run `AgentRuntime` normally; no trace object or trace identifier is
 passed through public constructors. Before each `run_turn`, the agent replaces its sole
-active trace and records the current `session_id`. `resume_turn` keeps that active trace.
+active trace, records the current `session_id`, and marks it as a user-input root boundary.
+The server never folds that boundary into an older active trace. `resume_turn` keeps the
+active trace and does not create a new user-input boundary.
 Each dynamic collector owns an independent trace and does not inherit client execution
-context. The server infers parent/child relationships from host-span timing and persists
-the resulting trace tree.
+context. Collectors do not carry the user-input boundary; the server infers their
+parent/child relationships from host-span timing and recent tool calls, then persists the
+resulting trace tree.
 
 For every model iteration, the first trace middleware emits a host start from
 `before_model`, the last trace middleware collects the prepared state and emits the
@@ -68,8 +71,8 @@ snapshot from `GET /api/v1/traces/{trace_id}`, and live updates from
 ## Tests
 
 ```bash
-PYTHONPYCACHEPREFIX=/private/tmp/bines_pycache \
-  /Users/nice/Env/anaconda3/envs/bines/bin/python -m pytest -q nTrace/tests
+PYTHONPYCACHEPREFIX=/private/tmp/path \
+  python -m pytest -q nTrace/tests
 
 cd nTrace/frontend
 npm test
