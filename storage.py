@@ -308,6 +308,89 @@ class TraceStorage:
             "spans": assemble_spans(events),
         }
 
+    def get_trace_timeline(self, trace_id: int) -> dict[str, Any] | None:
+        """Return only fields required to draw a trace timeline."""
+
+        with self._lock:
+            trace = self._connection.execute(
+                "SELECT trace_id, started_at, updated_at, status FROM traces WHERE trace_id=?",
+                (trace_id,),
+            ).fetchone()
+            if trace is None:
+                return None
+            agent_rows = self._connection.execute(
+                """
+                SELECT agent_id, parent_agent_id, agent_name, activation_order, first_seen_at
+                FROM agents WHERE trace_id=? ORDER BY activation_order, agent_id
+                """,
+                (trace_id,),
+            ).fetchall()
+            event_rows = self._connection.execute(
+                """
+                SELECT trace_id, span_id, event_type, timestamp, sender, agent_id,
+                       json_extract(payload_json, '$.parent_span_id') AS parent_span_id,
+                       json_extract(payload_json, '$.token_usage') AS token_usage_json
+                FROM events
+                WHERE trace_id=?
+                ORDER BY timestamp, event_type DESC
+                """,
+                (trace_id,),
+            ).fetchall()
+
+        agents = [dict(row) for row in agent_rows]
+        agents_by_id = {int(agent["agent_id"]): agent for agent in agents}
+        events: list[dict[str, Any]] = []
+        for row in event_rows:
+            agent = agents_by_id[int(row["agent_id"])]
+            token_usage_json = row["token_usage_json"]
+            events.append(
+                {
+                    "schema_version": 1,
+                    "trace_id": int(row["trace_id"]),
+                    "span_id": int(row["span_id"]),
+                    "parent_span_id": row["parent_span_id"],
+                    "agent_id": int(row["agent_id"]),
+                    "parent_agent_id": agent["parent_agent_id"],
+                    "agent_name": agent["agent_name"],
+                    "activation_order": int(agent["activation_order"]),
+                    "sender": row["sender"],
+                    "type": row["event_type"],
+                    "timestamp": row["timestamp"],
+                    "token_usage": json.loads(token_usage_json) if token_usage_json else {},
+                }
+            )
+        return {
+            **dict(trace),
+            "agents": agents,
+            "events": events,
+            "spans": assemble_spans(events),
+        }
+
+    def get_span(self, trace_id: int, span_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT payload_json FROM events
+                WHERE trace_id=? AND span_id=?
+                ORDER BY timestamp, event_type DESC
+                """,
+                (trace_id, span_id),
+            ).fetchall()
+        spans = assemble_spans([json.loads(row["payload_json"]) for row in rows])
+        return spans[0] if spans else None
+
+    def delete_trace(self, trace_id: int) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM traces WHERE trace_id=?",
+                (trace_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM trace_contexts WHERE root_trace_id=? OR source_trace_id=?",
+                (trace_id, trace_id),
+            )
+        return bool(cursor.rowcount)
+
 
 def assemble_spans(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[int, dict[str, dict[str, Any]]] = {}

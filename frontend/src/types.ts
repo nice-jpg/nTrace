@@ -13,14 +13,14 @@ export interface TraceEvent {
   sender: Sender
   type: EventType
   timestamp: string
-  system_prompt: unknown
-  user_inputs: unknown[]
-  output: unknown
-  tools: unknown[]
-  tools_called: unknown[]
-  tool_call_results: unknown[]
-  token_usage: Record<string, unknown>
-  data: unknown
+  system_prompt?: unknown
+  user_inputs?: unknown[]
+  output?: unknown
+  tools?: unknown[]
+  tools_called?: unknown[]
+  tool_call_results?: unknown[]
+  token_usage?: Record<string, unknown>
+  data?: unknown
 }
 
 export interface TraceSpan extends Omit<TraceEvent, 'type' | 'timestamp'> {

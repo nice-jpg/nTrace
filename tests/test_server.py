@@ -22,7 +22,27 @@ def test_api_persists_lists_and_streams_events(tmp_path) -> None:
         assert traces[0]["trace_id"] == 101
         detail = client.get("/api/v1/traces/101").json()
         assert detail["spans"][0]["running"] is True
+        timeline = client.get("/api/v1/traces/101/timeline").json()
+        assert "system_prompt" not in timeline["events"][0]
+        span = client.get("/api/v1/traces/101/spans/201").json()
+        assert span["system_prompt"] == "system"
         assert client.get("/api/v1/traces/999").status_code == 404
+
+
+def test_api_deletes_trace_and_broadcasts_removal(tmp_path) -> None:
+    app = create_app(database_path=tmp_path / "server.sqlite3", static_dir=tmp_path / "missing")
+    with TestClient(app) as client:
+        client.post("/api/v1/events", json=event("start"))
+        with client.websocket_connect("/api/v1/stream") as websocket:
+            websocket.receive_json()
+            response = client.delete("/api/v1/traces/101")
+            message = websocket.receive_json()
+
+        assert response.status_code == 200
+        assert response.json() == {"deleted": 101}
+        assert message == {"kind": "trace.deleted", "trace_id": 101}
+        assert client.get("/api/v1/traces/101").status_code == 404
+        assert client.delete("/api/v1/traces/101").status_code == 404
 
 
 def test_api_accepts_single_event_and_validates_sender(tmp_path) -> None:

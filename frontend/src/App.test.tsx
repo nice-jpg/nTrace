@@ -1,10 +1,12 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as api from './api'
 import App, { UserInputsSection } from './App'
 import type { TraceDetail, TraceEvent, TraceSpan, TraceSummary } from './types'
 
 vi.mock('./api', () => ({
+  deleteTrace: vi.fn(),
+  fetchSpan: vi.fn(),
   fetchTrace: vi.fn(),
   fetchTraces: vi.fn(),
   openTraceStream: vi.fn(() => () => undefined),
@@ -18,7 +20,10 @@ class ResizeObserverMock {
 
 vi.stubGlobal('ResizeObserver', ResizeObserverMock)
 
-afterEach(() => vi.clearAllMocks())
+afterEach(() => {
+  cleanup()
+  vi.clearAllMocks()
+})
 
 describe('trace input details', () => {
   it('labels and formats message, reasoning, and function call inputs', () => {
@@ -91,11 +96,15 @@ describe('trace input details', () => {
     }
     vi.mocked(api.fetchTraces).mockResolvedValue([summary])
     vi.mocked(api.fetchTrace).mockResolvedValue(detail)
+    vi.mocked(api.fetchSpan).mockResolvedValue(span)
+    vi.mocked(api.deleteTrace).mockResolvedValue()
 
     const { container } = render(<App />)
+    expect(api.fetchSpan).not.toHaveBeenCalled()
     fireEvent.click(await screen.findByTitle(/HOST/))
 
     await waitFor(() => expect(container.querySelector('.detail-drawer')).toBeInTheDocument())
+    await waitFor(() => expect(api.fetchSpan).toHaveBeenCalledWith(1, 2))
     const workspace = container.querySelector('.workspace')
     const drawer = container.querySelector('.detail-drawer')
     expect(workspace).toHaveClass('detail-open')
@@ -105,5 +114,45 @@ describe('trace input details', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close details' }))
     expect(container.querySelector('.detail-drawer')).not.toBeInTheDocument()
     expect(workspace).not.toHaveClass('detail-open')
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: /#1running/i }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete trace #1' }))
+    await waitFor(() => expect(api.deleteTrace).toHaveBeenCalledWith(1))
+  })
+
+  it('reuses the three most recently visited trace pages and reloads an evicted page', async () => {
+    const summaries: TraceSummary[] = [1, 2, 3, 4].map((traceId) => ({
+      trace_id: traceId,
+      started_at: `2026-01-01T00:00:0${traceId}.000Z`,
+      updated_at: `2026-01-01T00:00:0${traceId}.000Z`,
+      status: 'completed',
+      agent_count: 0,
+      span_count: 0,
+    }))
+    vi.mocked(api.fetchTraces).mockResolvedValue(summaries)
+    vi.mocked(api.fetchTrace).mockImplementation(async (traceId) => ({
+      ...summaries.find((trace) => trace.trace_id === traceId)!,
+      agents: [],
+      events: [],
+      spans: [],
+    }))
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Trace 1' })
+
+    const selectTrace = async (traceId: number) => {
+      fireEvent.click(screen.getByRole('button', { name: new RegExp(`#${traceId}completed`, 'i') }))
+      await screen.findByRole('heading', { name: `Trace ${traceId}` })
+    }
+    await selectTrace(2)
+    await selectTrace(3)
+    await selectTrace(1)
+    await selectTrace(4)
+    await selectTrace(1)
+
+    expect(vi.mocked(api.fetchTrace).mock.calls.filter(([traceId]) => traceId === 1)).toHaveLength(1)
+
+    await selectTrace(2)
+    expect(vi.mocked(api.fetchTrace).mock.calls.filter(([traceId]) => traceId === 2)).toHaveLength(2)
   })
 })

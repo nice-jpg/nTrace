@@ -100,7 +100,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["*"],
     )
 
@@ -127,6 +127,27 @@ def create_app(
         if trace is None:
             raise HTTPException(status_code=404, detail="Trace not found")
         return trace
+
+    @app.get("/api/v1/traces/{trace_id}/timeline")
+    async def get_trace_timeline(trace_id: int) -> dict[str, Any]:
+        trace = storage.get_trace_timeline(trace_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail="Trace not found")
+        return trace
+
+    @app.get("/api/v1/traces/{trace_id}/spans/{span_id}")
+    async def get_span(trace_id: int, span_id: int) -> dict[str, Any]:
+        span = storage.get_span(trace_id, span_id)
+        if span is None:
+            raise HTTPException(status_code=404, detail="Span not found")
+        return span
+
+    @app.delete("/api/v1/traces/{trace_id}")
+    async def delete_trace(trace_id: int) -> dict[str, int]:
+        if not storage.delete_trace(trace_id):
+            raise HTTPException(status_code=404, detail="Trace not found")
+        await stream.broadcast({"kind": "trace.deleted", "trace_id": trace_id})
+        return {"deleted": trace_id}
 
     @app.websocket("/api/v1/stream")
     async def websocket_stream(websocket: WebSocket) -> None:

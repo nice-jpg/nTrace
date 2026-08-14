@@ -58,6 +58,48 @@ def test_start_only_span_remains_running(tmp_path) -> None:
     storage.close()
 
 
+def test_timeline_omits_heavy_payload_and_span_detail_loads_it_on_demand(tmp_path) -> None:
+    storage = TraceStorage(tmp_path / "trace.sqlite3")
+    storage.put_events(
+        [
+            event("start", system_prompt="large-system", user_inputs=["large-input"]),
+            event(
+                "end",
+                system_prompt=None,
+                output="large-output",
+                token_usage={"total_tokens": 123},
+                tool_call_results=[{"content": "large-result"}],
+            ),
+        ]
+    )
+
+    timeline = storage.get_trace_timeline(101)
+    assert timeline is not None
+    assert "system_prompt" not in timeline["events"][0]
+    assert "user_inputs" not in timeline["events"][0]
+    assert "output" not in timeline["events"][1]
+    assert timeline["spans"][0]["token_usage"] == {"total_tokens": 123}
+
+    span = storage.get_span(101, 201)
+    assert span is not None
+    assert span["system_prompt"] == "large-system"
+    assert span["output"] == "large-output"
+    assert span["tool_call_results"] == [{"content": "large-result"}]
+    storage.close()
+
+
+def test_delete_trace_removes_events_agents_and_context(tmp_path) -> None:
+    storage = TraceStorage(tmp_path / "trace.sqlite3")
+    storage.put_events([event("start")])
+
+    assert storage.delete_trace(101) is True
+    assert storage.get_trace(101) is None
+    assert storage.get_trace_timeline(101) is None
+    assert storage.get_span(101, 201) is None
+    assert storage.delete_trace(101) is False
+    storage.close()
+
+
 def test_server_infers_child_trace_from_active_host_timing(tmp_path) -> None:
     storage = TraceStorage(tmp_path / "trace.sqlite3")
     root_start = event("start", trace_id=101, span_id=201, agent_name="conductor")

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
-import { fetchTrace, fetchTraces, openTraceStream } from './api'
+import { deleteTrace as deleteTraceRequest, fetchSpan, fetchTrace, fetchTraces, openTraceStream } from './api'
 import {
   AGENT_HEIGHT,
   LABEL_WIDTH,
@@ -20,6 +20,7 @@ import {
   upsertEvent,
 } from './traceMath'
 import type { AgentSummary, TraceDetail, TraceEvent, TraceSpan, TraceSummary } from './types'
+import { getCachedTrace, putCachedTrace } from './traceCache'
 
 const Icon = ({ name }: { name: 'trace' | 'activity' | 'chevron' | 'copy' | 'close' }) => {
   const paths = {
@@ -32,15 +33,25 @@ const Icon = ({ name }: { name: 'trace' | 'activity' | 'chevron' | 'copy' | 'clo
   return <svg viewBox="0 0 24 24" aria-hidden="true">{paths[name]}</svg>
 }
 
+interface SpanSelection {
+  timeline: TraceSpan
+  detail: TraceSpan | null
+  loading: boolean
+  error: string
+}
+
 export default function App() {
   const [traces, setTraces] = useState<TraceSummary[]>([])
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [detail, setDetail] = useState<TraceDetail | null>(null)
-  const [selectedSpan, setSelectedSpan] = useState<TraceSpan | null>(null)
+  const [selectedSpan, setSelectedSpan] = useState<SpanSelection | null>(null)
   const [historyOpen, setHistoryOpen] = useState(true)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState('')
   const selectedIdRef = useRef<number | null>(null)
+  const traceCacheRef = useRef(new Map<number, TraceDetail>())
+  const spanCacheRef = useRef(new Map<number, Map<number, TraceSpan>>())
+  const spanRequestRef = useRef(0)
 
   useEffect(() => { selectedIdRef.current = selectedId }, [selectedId])
 
@@ -55,14 +66,88 @@ export default function App() {
     }
   }, [])
 
-  const refreshSelected = useCallback(async (traceId: number | null = selectedIdRef.current) => {
+  const cacheTrace = useCallback((trace: TraceDetail) => {
+    const evicted = putCachedTrace(traceCacheRef.current, trace)
+    evicted.forEach((traceId) => spanCacheRef.current.delete(traceId))
+  }, [])
+
+  const refreshSelected = useCallback(async (
+    traceId: number | null = selectedIdRef.current,
+    force = false,
+  ) => {
     if (traceId === null) return
+    if (!force) {
+      const cached = getCachedTrace(traceCacheRef.current, traceId)
+      if (cached) {
+        setDetail(cached)
+        setError('')
+        return
+      }
+    }
+    setDetail(null)
     try {
-      setDetail(await fetchTrace(traceId))
+      const next = await fetchTrace(traceId)
+      cacheTrace(next)
+      if (selectedIdRef.current !== traceId) return
+      setDetail(next)
+      setError('')
+    } catch (reason) {
+      if (selectedIdRef.current !== traceId) return
+      setError(reason instanceof Error ? reason.message : String(reason))
+    }
+  }, [cacheTrace])
+
+  const removeTraceLocally = useCallback((traceId: number) => {
+    traceCacheRef.current.delete(traceId)
+    spanCacheRef.current.delete(traceId)
+    setTraces((current) => current.filter((trace) => trace.trace_id !== traceId))
+    if (selectedIdRef.current === traceId) {
+      setSelectedSpan(null)
+      setDetail(null)
+      setSelectedId(null)
+      void refreshTraces()
+    }
+  }, [refreshTraces])
+
+  const deleteTrace = useCallback(async (traceId: number) => {
+    try {
+      await deleteTraceRequest(traceId)
+      removeTraceLocally(traceId)
       setError('')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))
     }
+  }, [removeTraceLocally])
+
+  const selectSpan = useCallback(async (span: TraceSpan) => {
+    const requestId = ++spanRequestRef.current
+    const cached = spanCacheRef.current.get(span.trace_id)?.get(span.span_id)
+    setSelectedSpan({ timeline: span, detail: cached ?? null, loading: !cached, error: '' })
+    if (cached) return
+    try {
+      const next = await fetchSpan(span.trace_id, span.span_id)
+      let traceSpans = spanCacheRef.current.get(span.trace_id)
+      if (!traceSpans) {
+        traceSpans = new Map<number, TraceSpan>()
+        spanCacheRef.current.set(span.trace_id, traceSpans)
+      }
+      traceSpans.set(span.span_id, next)
+      if (requestId !== spanRequestRef.current) return
+      setSelectedSpan({ timeline: span, detail: next, loading: false, error: '' })
+    } catch (reason) {
+      if (requestId !== spanRequestRef.current) return
+      setSelectedSpan({
+        timeline: span,
+        detail: null,
+        loading: false,
+        error: reason instanceof Error ? reason.message : String(reason),
+      })
+    }
+  }, [])
+
+  const clearSelectedSpan = useCallback(() => {
+    spanRequestRef.current += 1
+    setSelectedSpan(null)
   }, [])
 
   useEffect(() => { void refreshTraces() }, [refreshTraces])
@@ -73,17 +158,22 @@ export default function App() {
       setConnected(true)
       setTraces((current) => updateTraceSummaries(current, event))
       if (selectedIdRef.current === null) setSelectedId(event.trace_id)
+      spanCacheRef.current.get(event.trace_id)?.delete(event.span_id)
+      const cached = traceCacheRef.current.get(event.trace_id)
+      const cachedUpdate = cached ? mergeLiveEvent(cached, event) : null
+      if (cachedUpdate) traceCacheRef.current.set(event.trace_id, cachedUpdate)
       setDetail((current) => {
         if (!current || current.trace_id !== event.trace_id) return current
-        return mergeLiveEvent(current, event)
+        return cachedUpdate ?? mergeLiveEvent(current, event)
       })
     },
     () => {
       setConnected(true)
       void refreshTraces()
-      void refreshSelected()
+      void refreshSelected(undefined, true)
     },
-  ), [refreshSelected, refreshTraces])
+    removeTraceLocally,
+  ), [refreshSelected, refreshTraces, removeTraceLocally])
 
   return (
     <div className="app-shell">
@@ -102,7 +192,8 @@ export default function App() {
         traces={traces}
         selectedId={selectedId}
         onToggle={() => setHistoryOpen((value) => !value)}
-        onSelect={(id) => { setSelectedId(id); setSelectedSpan(null) }}
+        onSelect={(id) => { setSelectedId(id); clearSelectedSpan() }}
+        onDelete={(id) => void deleteTrace(id)}
       />
 
       <main className={`workspace ${selectedSpan ? 'detail-open' : ''}`}>
@@ -125,25 +216,51 @@ export default function App() {
         {detail && (
           <Timeline
             trace={detail}
-            selectedSpanId={selectedSpan?.span_id ?? null}
-            onSelectSpan={setSelectedSpan}
+            selectedSpanId={selectedSpan?.timeline.span_id ?? null}
+            onSelectSpan={(span) => void selectSpan(span)}
           />
         )}
-        {selectedSpan && <DetailDrawer span={selectedSpan} onClose={() => setSelectedSpan(null)} />}
+        {selectedSpan && (
+          <DetailDrawer
+            span={selectedSpan.detail ?? selectedSpan.timeline}
+            loading={selectedSpan.loading}
+            error={selectedSpan.error}
+            onClose={clearSelectedSpan}
+          />
+        )}
       </main>
     </div>
   )
 }
 
 function HistoryPanel({
-  open, traces, selectedId, onToggle, onSelect,
+  open, traces, selectedId, onToggle, onSelect, onDelete,
 }: {
   open: boolean
   traces: TraceSummary[]
   selectedId: number | null
   onToggle: () => void
   onSelect: (traceId: number) => void
+  onDelete: (traceId: number) => void
 }) {
+  const [contextMenu, setContextMenu] = useState<{ traceId: number; x: number; y: number } | null>(null)
+
+  useEffect(() => {
+    if (!contextMenu) return
+    const close = () => setContextMenu(null)
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close()
+    }
+    window.addEventListener('click', close)
+    window.addEventListener('blur', close)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('blur', close)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [contextMenu])
+
   return (
     <aside className={`history-panel ${open ? 'open' : 'closed'}`}>
       <div className="history-heading">
@@ -158,6 +275,10 @@ function HistoryPanel({
             key={trace.trace_id}
             className={`history-card ${selectedId === trace.trace_id ? 'selected' : ''}`}
             onClick={() => onSelect(trace.trace_id)}
+            onContextMenu={(event) => {
+              event.preventDefault()
+              setContextMenu({ traceId: trace.trace_id, x: event.clientX, y: event.clientY })
+            }}
           >
             <div className="history-card-top">
               <code>#{shortId(trace.trace_id)}</code>
@@ -172,6 +293,25 @@ function HistoryPanel({
         ))}
         {traces.length === 0 && <div className="history-empty">Waiting for the first trace…</div>}
       </div>}
+      {contextMenu && (
+        <div
+          className="trace-context-menu"
+          role="menu"
+          style={{
+            left: Math.min(contextMenu.x, window.innerWidth - 156),
+            top: Math.min(contextMenu.y, window.innerHeight - 52),
+          }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            role="menuitem"
+            onClick={() => {
+              onDelete(contextMenu.traceId)
+              setContextMenu(null)
+            }}
+          >Delete trace #{shortId(contextMenu.traceId)}</button>
+        </div>
+      )}
     </aside>
   )
 }
@@ -404,7 +544,12 @@ function ConnectorLayer({ agents, spans, connectors, startMs, pixelsPerMs, width
   )
 }
 
-function DetailDrawer({ span, onClose }: { span: TraceSpan; onClose: () => void }) {
+function DetailDrawer({ span, loading, error, onClose }: {
+  span: TraceSpan
+  loading: boolean
+  error: string
+  onClose: () => void
+}) {
   const [copied, setCopied] = useState(false)
   const [height, setHeight] = useState(() => clampDrawerHeight(Math.min(window.innerHeight * 0.46, 480), window.innerHeight))
   const dragRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null)
@@ -473,16 +618,18 @@ function DetailDrawer({ span, onClose }: { span: TraceSpan; onClose: () => void 
         <Metric label="Status" value={span.running ? 'Running' : 'Complete'} />
         {span.sender === 'llm' && <Metric label="Weighted cost" value={tokenCost(span)?.toLocaleString() ?? '—'} />}
       </div>
-      <div className="drawer-grid">
+      {loading && <div className="drawer-loading">Loading span details…</div>}
+      {error && <div className="drawer-load-error">{error}</div>}
+      {!loading && !error && <div className="drawer-grid">
         <JsonSection title="System prompt" value={span.system_prompt} wide />
-        <UserInputsSection inputs={span.user_inputs} />
+        <UserInputsSection inputs={span.user_inputs ?? []} />
         <JsonSection title="Output" value={span.output} />
         <JsonSection title="Tools" value={span.tools} />
         <JsonSection title="Tools called" value={span.tools_called} />
         {span.sender === 'host' && <JsonSection title="Tool call results" value={span.tool_call_results} />}
-        <TokenUsageSection usage={span.token_usage} />
+        <TokenUsageSection usage={span.token_usage ?? {}} />
         <JsonSection title="Additional data" value={span.data} wide />
-      </div>
+      </div>}
     </aside>
   )
 }
@@ -624,7 +771,7 @@ function updateTraceSummaries(current: TraceSummary[], event: TraceEvent): Trace
 }
 
 function llmLabel(span: TraceSpan): string {
-  const calls = span.tools_called
+  const calls = span.tools_called ?? []
   if (Array.isArray(calls) && calls.length) return `LLM · ${calls.length} tool${calls.length === 1 ? '' : 's'}`
   return 'LLM response'
 }
