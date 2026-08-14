@@ -82,7 +82,7 @@ describe('trace timeline math', () => {
 
   it('clamps the detail drawer between its minimum and the visible viewport', () => {
     expect(clampDrawerHeight(80, 800)).toBe(190)
-    expect(clampDrawerHeight(900, 800)).toBe(728)
+    expect(clampDrawerHeight(900, 800)).toBe(600)
     expect(clampDrawerHeight(420, 800)).toBe(420)
   })
 

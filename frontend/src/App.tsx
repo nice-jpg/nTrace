@@ -105,7 +105,7 @@ export default function App() {
         onSelect={(id) => { setSelectedId(id); setSelectedSpan(null) }}
       />
 
-      <main className="workspace">
+      <main className={`workspace ${selectedSpan ? 'detail-open' : ''}`}>
         <header className="topbar">
           <div>
             <span className="eyebrow">AGENT SMART TRACE</span>
@@ -129,9 +129,8 @@ export default function App() {
             onSelectSpan={setSelectedSpan}
           />
         )}
+        {selectedSpan && <DetailDrawer span={selectedSpan} onClose={() => setSelectedSpan(null)} />}
       </main>
-
-      {selectedSpan && <DetailDrawer span={selectedSpan} onClose={() => setSelectedSpan(null)} />}
     </div>
   )
 }

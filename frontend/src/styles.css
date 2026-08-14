@@ -111,7 +111,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .empty-state p { margin: 0 0 18px; font-size: 12px; }
 .empty-state code { padding: 8px 12px; border: 1px solid var(--line); border-radius: 6px; background: #091523; color: #8ca0b9; font: 400 10px DM Mono, monospace; }
 
-.detail-drawer { position: fixed; z-index: 50; left: 74px; right: 0; bottom: 0; width: auto; max-width: calc(100vw - 74px); min-width: 0; min-height: 190px; max-height: calc(100vh - 72px); background: rgba(8,17,29,.98); border-top: 1px solid rgba(145,171,205,.25); box-shadow: 0 -20px 60px rgba(0,0,0,.38); backdrop-filter: blur(24px); animation: drawer-in .2s ease-out; overflow-y: auto; overscroll-behavior: contain; }
+.detail-drawer { position: relative; z-index: 15; flex: 0 0 auto; width: 100%; max-width: 100%; min-width: 0; min-height: 190px; max-height: calc(100vh - 200px); background: rgba(8,17,29,.98); border-top: 1px solid rgba(145,171,205,.25); box-shadow: 0 -20px 60px rgba(0,0,0,.38); backdrop-filter: blur(24px); animation: drawer-in .2s ease-out; overflow-y: auto; overscroll-behavior: contain; }
 @keyframes drawer-in { from { transform: translateY(35px); opacity: .5; } }
 .drawer-resizer { position: sticky; top: 0; z-index: 4; width: 100%; height: 15px; display: grid; place-items: center; cursor: ns-resize; touch-action: none; background: linear-gradient(to bottom, rgba(28,43,62,.68), transparent); }
 .drawer-resizer span { width: 44px; height: 3px; border-radius: 2px; background: #40536d; transition: width .15s, background .15s; }
@@ -175,7 +175,6 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   .topbar { padding: 0 14px; }
   .timeline-card { max-width: calc(100% - 20px); margin: 10px; }
   .legend span:last-child { display: none; }
-  .detail-drawer { left: 60px; max-width: calc(100vw - 60px); }
   .drawer-summary { overflow-x: auto; }
   .drawer-grid { grid-template-columns: minmax(0, 1fr); }
   .drawer-grid details.wide { grid-column: auto; }

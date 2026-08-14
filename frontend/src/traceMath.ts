@@ -83,7 +83,12 @@ export function centeredZoomScrollLeft({
 }
 
 export function clampDrawerHeight(height: number, viewportHeight: number): number {
-  return Math.min(Math.max(190, height), Math.max(190, viewportHeight - 72))
+  const minimumHeight = 190
+  const workspaceReserve = 200
+  return Math.min(
+    Math.max(minimumHeight, height),
+    Math.max(minimumHeight, viewportHeight - workspaceReserve),
+  )
 }
 
 export function tokenTotal(span: TraceSpan): number | null {
