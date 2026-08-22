@@ -13,8 +13,29 @@ export async function fetchTrace(traceId: number): Promise<TraceDetail> {
 }
 
 export async function fetchSpan(traceId: number, spanId: number): Promise<TraceSpan> {
-  const response = await fetch(`/api/v1/traces/${traceId}/spans/${spanId}`)
+  const response = await fetch(`/api/v1/traces/${traceId}/spans/${spanId}/details`)
   if (!response.ok) throw new Error(`Unable to load span (${response.status})`)
+  return response.json()
+}
+
+export interface UserInputsPage {
+  items: unknown[]
+  offset: number
+  limit: number
+  total: number
+  has_more: boolean
+}
+
+export async function fetchUserInputs(
+  traceId: number,
+  spanId: number,
+  offset: number,
+  limit = 10,
+): Promise<UserInputsPage> {
+  const response = await fetch(
+    `/api/v1/traces/${traceId}/spans/${spanId}/user-inputs?offset=${offset}&limit=${limit}`,
+  )
+  if (!response.ok) throw new Error(`Unable to load user inputs (${response.status})`)
   return response.json()
 }
 

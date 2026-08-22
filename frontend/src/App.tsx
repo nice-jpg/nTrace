@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { PointerEvent as ReactPointerEvent } from 'react'
-import { deleteTrace as deleteTraceRequest, fetchSpan, fetchTrace, fetchTraces, openTraceStream } from './api'
+import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
+import { deleteTrace as deleteTraceRequest, fetchSpan, fetchTrace, fetchTraces, fetchUserInputs, openTraceStream } from './api'
 import {
-  AGENT_HEIGHT,
   LABEL_WIDTH,
   RULER_HEIGHT,
   assembleSpans,
@@ -13,6 +12,7 @@ import {
   formatDuration,
   formatTickLabel,
   latestEventTime,
+  layoutAgentRows,
   layoutSpan,
   tokenColor,
   tokenCost,
@@ -20,6 +20,7 @@ import {
   upsertEvent,
 } from './traceMath'
 import type { AgentSummary, TraceDetail, TraceEvent, TraceSpan, TraceSummary } from './types'
+import type { AgentRowLayout } from './traceMath'
 import { getCachedTrace, putCachedTrace } from './traceCache'
 
 const Icon = ({ name }: { name: 'trace' | 'activity' | 'chevron' | 'copy' | 'close' }) => {
@@ -119,11 +120,23 @@ export default function App() {
     }
   }, [removeTraceLocally])
 
-  const selectSpan = useCallback(async (span: TraceSpan) => {
-    const requestId = ++spanRequestRef.current
+  const selectSpan = useCallback((span: TraceSpan) => {
+    spanRequestRef.current += 1
+    setSelectedSpan({ timeline: span, detail: null, loading: false, error: '' })
+  }, [])
+
+  const loadSpanDetails = useCallback(async (span: TraceSpan) => {
     const cached = spanCacheRef.current.get(span.trace_id)?.get(span.span_id)
-    setSelectedSpan({ timeline: span, detail: cached ?? null, loading: !cached, error: '' })
-    if (cached) return
+    if (cached) {
+      setSelectedSpan((current) => current?.timeline.span_id === span.span_id
+        ? { ...current, detail: cached, loading: false, error: '' }
+        : current)
+      return
+    }
+    const requestId = ++spanRequestRef.current
+    setSelectedSpan((current) => current?.timeline.span_id === span.span_id
+      ? { ...current, loading: true, error: '' }
+      : current)
     try {
       const next = await fetchSpan(span.trace_id, span.span_id)
       let traceSpans = spanCacheRef.current.get(span.trace_id)
@@ -217,14 +230,16 @@ export default function App() {
           <Timeline
             trace={detail}
             selectedSpanId={selectedSpan?.timeline.span_id ?? null}
-            onSelectSpan={(span) => void selectSpan(span)}
+            onSelectSpan={selectSpan}
           />
         )}
         {selectedSpan && (
           <DetailDrawer
+            key={`${selectedSpan.timeline.trace_id}:${selectedSpan.timeline.span_id}`}
             span={selectedSpan.detail ?? selectedSpan.timeline}
             loading={selectedSpan.loading}
             error={selectedSpan.error}
+            onLoadDetails={() => void loadSpanDetails(selectedSpan.timeline)}
             onClose={clearSelectedSpan}
           />
         )}
@@ -325,6 +340,7 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
   const [viewportWidth, setViewportWidth] = useState(900)
   const [zoom, setZoom] = useState(1)
   const [follow, setFollow] = useState(true)
+  const [collapsedAgentIds, setCollapsedAgentIds] = useState<Set<number>>(() => new Set())
 
   useEffect(() => {
     const element = viewportRef.current
@@ -334,6 +350,11 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
     return () => observer.disconnect()
   }, [])
   const agents = useMemo(() => [...trace.agents].sort((a, b) => a.activation_order - b.activation_order), [trace.agents])
+  const rowLayouts = useMemo(
+    () => layoutAgentRows(agents.map((agent) => agent.agent_id), collapsedAgentIds),
+    [agents, collapsedAgentIds],
+  )
+  const rowsHeight = rowLayouts.reduce((height, row) => height + row.height, 0)
   const spans = trace.spans
   const startMs = Math.min(...spans.map((span) => Date.parse(span.started_at)), Date.parse(trace.started_at))
   const latestMs = latestEventTime(trace.events, startMs)
@@ -437,17 +458,17 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
           if (element && element.scrollWidth - element.scrollLeft - element.clientWidth > 48) setFollow(false)
         }}
       >
-        <div className="timeline-stage" style={{ width: canvasWidth + LABEL_WIDTH, height: RULER_HEIGHT + agents.length * AGENT_HEIGHT }}>
+        <div className="timeline-stage" style={{ width: canvasWidth + LABEL_WIDTH, height: RULER_HEIGHT + rowsHeight }}>
           <div className="ruler-corner">AGENT / SOURCE</div>
           <div className="time-ruler" style={{ left: LABEL_WIDTH, width: canvasWidth }}>
             {ticks.map((tick) => <div className="tick" key={tick.left} style={{ left: tick.left }}><span>{formatTickLabel(tick.elapsed, durationMs)}</span></div>)}
           </div>
-          <ConnectorLayer agents={agents} spans={spans} connectors={connectorSpans} startMs={startMs} pixelsPerMs={pixelsPerMs} width={canvasWidth} />
+          <ConnectorLayer rowLayouts={rowLayouts} spans={spans} connectors={connectorSpans} startMs={startMs} pixelsPerMs={pixelsPerMs} width={canvasWidth} height={rowsHeight} />
           {agents.map((agent, agentIndex) => (
             <AgentRows
               key={agent.agent_id}
               agent={agent}
-              index={agentIndex}
+              layout={rowLayouts[agentIndex]}
               spans={spans.filter((span) => span.agent_id === agent.agent_id)}
               startMs={startMs}
               timelineEndMs={latestMs}
@@ -458,6 +479,12 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
               childParentIds={childParentIds}
               selectedSpanId={selectedSpanId}
               onSelectSpan={onSelectSpan}
+              onToggleCollapsed={() => setCollapsedAgentIds((current) => {
+                const next = new Set(current)
+                if (next.has(agent.agent_id)) next.delete(agent.agent_id)
+                else next.add(agent.agent_id)
+                return next
+              })}
             />
           ))}
         </div>
@@ -466,9 +493,9 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
   )
 }
 
-function AgentRows({ agent, index, spans, startMs, timelineEndMs, pixelsPerMs, canvasWidth, viewportWidth, eventOrder, childParentIds, selectedSpanId, onSelectSpan }: {
+function AgentRows({ agent, layout, spans, startMs, timelineEndMs, pixelsPerMs, canvasWidth, viewportWidth, eventOrder, childParentIds, selectedSpanId, onSelectSpan, onToggleCollapsed }: {
   agent: AgentSummary
-  index: number
+  layout: AgentRowLayout
   spans: TraceSpan[]
   startMs: number
   timelineEndMs: number
@@ -479,14 +506,21 @@ function AgentRows({ agent, index, spans, startMs, timelineEndMs, pixelsPerMs, c
   childParentIds: Set<number>
   selectedSpanId: number | null
   onSelectSpan: (span: TraceSpan) => void
+  onToggleCollapsed: () => void
 }) {
   return (
-    <div className="agent-row" style={{ top: RULER_HEIGHT + index * AGENT_HEIGHT }}>
+    <div className={`agent-row ${layout.collapsed ? 'collapsed' : ''}`} style={{ top: RULER_HEIGHT + layout.top, height: layout.height }}>
       <div className="agent-label">
         <span className="agent-index">{String(agent.activation_order).padStart(2, '0')}</span>
         <div><strong>{agent.agent_name}</strong><small>{agent.parent_agent_id ? `child of ${agent.parent_agent_id}` : 'main agent'}</small></div>
+        <button
+          className="agent-collapse-button"
+          onClick={onToggleCollapsed}
+          aria-label={`${layout.collapsed ? 'Expand' : 'Collapse'} agent ${agent.agent_name}`}
+          title={`${layout.collapsed ? 'Expand' : 'Collapse'} agent lanes`}
+        ><Icon name="chevron" /></button>
       </div>
-      {(['host', 'llm'] as const).map((sender) => (
+      {!layout.collapsed && (['host', 'llm'] as const).map((sender) => (
         <div key={sender} className={`lane lane-${sender}`} style={{ left: LABEL_WIDTH, width: canvasWidth }}>
           <span className="lane-name">{sender}</span>
           {spans.filter((span) => span.sender === sender).map((span, spanIndex) => {
@@ -519,35 +553,37 @@ function AgentRows({ agent, index, spans, startMs, timelineEndMs, pixelsPerMs, c
   )
 }
 
-function ConnectorLayer({ agents, spans, connectors, startMs, pixelsPerMs, width }: {
-  agents: AgentSummary[]
+function ConnectorLayer({ rowLayouts, spans, connectors, startMs, pixelsPerMs, width, height }: {
+  rowLayouts: AgentRowLayout[]
   spans: TraceSpan[]
   connectors: TraceSpan[]
   startMs: number
   pixelsPerMs: number
   width: number
+  height: number
 }) {
-  const agentIndex = new Map(agents.map((agent, index) => [agent.agent_id, index]))
+  const layoutByAgent = new Map(rowLayouts.map((layout) => [layout.agentId, layout]))
   return (
-    <svg className="connector-layer" style={{ left: LABEL_WIDTH, top: RULER_HEIGHT, width, height: agents.length * AGENT_HEIGHT }}>
+    <svg className="connector-layer" style={{ left: LABEL_WIDTH, top: RULER_HEIGHT, width, height }}>
       {connectors.map((span) => {
         const parent = spans.find((candidate) => candidate.span_id === span.parent_span_id)
-        const fromIndex = parent ? agentIndex.get(parent.agent_id) : undefined
-        const toIndex = agentIndex.get(span.agent_id)
-        if (fromIndex === undefined || toIndex === undefined) return null
+        const fromLayout = parent ? layoutByAgent.get(parent.agent_id) : undefined
+        const toLayout = layoutByAgent.get(span.agent_id)
+        if (!fromLayout || !toLayout) return null
         const x = Math.max(4, (Date.parse(span.started_at) - startMs) * pixelsPerMs)
-        const fromY = fromIndex * AGENT_HEIGHT + 27
-        const toY = toIndex * AGENT_HEIGHT + 27
+        const fromY = fromLayout.top + (fromLayout.collapsed ? fromLayout.height / 2 : 27)
+        const toY = toLayout.top + (toLayout.collapsed ? toLayout.height / 2 : 27)
         return <path key={span.span_id} d={`M ${x} ${fromY} h 14 V ${toY} h 9`} />
       })}
     </svg>
   )
 }
 
-function DetailDrawer({ span, loading, error, onClose }: {
+function DetailDrawer({ span, loading, error, onLoadDetails, onClose }: {
   span: TraceSpan
   loading: boolean
   error: string
+  onLoadDetails: () => void
   onClose: () => void
 }) {
   const [copied, setCopied] = useState(false)
@@ -618,25 +654,23 @@ function DetailDrawer({ span, loading, error, onClose }: {
         <Metric label="Status" value={span.running ? 'Running' : 'Complete'} />
         {span.sender === 'llm' && <Metric label="Weighted cost" value={tokenCost(span)?.toLocaleString() ?? '—'} />}
       </div>
-      {loading && <div className="drawer-loading">Loading span details…</div>}
-      {error && <div className="drawer-load-error">{error}</div>}
-      {!loading && !error && <div className="drawer-grid">
-        <JsonSection title="System prompt" value={span.system_prompt} wide />
-        <UserInputsSection inputs={span.user_inputs ?? []} />
-        <JsonSection title="Output" value={span.output} />
-        <JsonSection title="Tools" value={span.tools} />
-        <JsonSection title="Tools called" value={span.tools_called} />
-        {span.sender === 'host' && <JsonSection title="Tool call results" value={span.tool_call_results} />}
-        <TokenUsageSection usage={span.token_usage ?? {}} />
-        <JsonSection title="Additional data" value={span.data} wide />
-      </div>}
+      <div className="drawer-grid">
+        <JsonSection title="System prompt" value={span.system_prompt} wide loading={loading} error={error} onOpen={onLoadDetails} />
+        <LazyUserInputsSection traceId={span.trace_id} spanId={span.span_id} />
+        <JsonSection title="Output" value={span.output} loading={loading} error={error} onOpen={onLoadDetails} />
+        <JsonSection title="Tools" value={span.tools} loading={loading} error={error} onOpen={onLoadDetails} />
+        <JsonSection title="Tools called" value={span.tools_called} loading={loading} error={error} onOpen={onLoadDetails} />
+        {span.sender === 'host' && <JsonSection title="Tool call results" value={span.tool_call_results} loading={loading} error={error} onOpen={onLoadDetails} />}
+        <TokenUsageSection usage={span.token_usage ?? {}} loading={loading} error={error} onOpen={onLoadDetails} />
+        <JsonSection title="Additional data" value={span.data} wide loading={loading} error={error} onOpen={onLoadDetails} />
+      </div>
     </aside>
   )
 }
 
-export function UserInputsSection({ inputs }: { inputs: unknown[] }) {
+export function UserInputsSection({ inputs, defaultOpen = false }: { inputs: unknown[]; defaultOpen?: boolean }) {
   return (
-    <details className="user-inputs-section wide" open>
+    <details className="user-inputs-section wide" open={defaultOpen}>
       <summary>User inputs <span>{inputs.length}</span></summary>
       <div className="user-input-list">
         {inputs.length === 0 && <div className="detail-empty">No user inputs</div>}
@@ -650,6 +684,69 @@ export function UserInputsSection({ inputs }: { inputs: unknown[] }) {
           </article>
         ))}
       </div>
+    </details>
+  )
+}
+
+function LazyUserInputsSection({ traceId, spanId }: { traceId: number; spanId: number }) {
+  const [open, setOpen] = useState(false)
+  const [inputs, setInputs] = useState<unknown[]>([])
+  const [total, setTotal] = useState<number | null>(null)
+  const [hasMore, setHasMore] = useState(true)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const loadingRef = useRef(false)
+
+  const loadMore = useCallback(async () => {
+    if (loadingRef.current || !hasMore) return
+    loadingRef.current = true
+    setLoading(true)
+    setError('')
+    try {
+      const page = await fetchUserInputs(traceId, spanId, inputs.length, 10)
+      setInputs((current) => [...current, ...page.items])
+      setTotal(page.total)
+      setHasMore(page.has_more)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      loadingRef.current = false
+      setLoading(false)
+    }
+  }, [hasMore, inputs.length, spanId, traceId])
+
+  return (
+    <details
+      className="user-inputs-section wide"
+      open={open}
+      onToggle={(event) => {
+        const nextOpen = event.currentTarget.open
+        setOpen(nextOpen)
+        if (nextOpen && total === null) void loadMore()
+      }}
+    >
+      <summary>User inputs {total !== null && <span>{total}</span>}</summary>
+      {open && <div
+        className="user-input-list lazy"
+        onScroll={(event) => {
+          const element = event.currentTarget
+          if (element.scrollHeight - element.scrollTop - element.clientHeight <= 40) void loadMore()
+        }}
+      >
+        {!loading && !error && inputs.length === 0 && <div className="detail-empty">No user inputs</div>}
+        {inputs.map((input, index) => (
+          <article className="user-input-item" key={index}>
+            <header>
+              <span>Input {total === null ? '—' : String(total - index).padStart(2, '0')}</span>
+              <b>{inputLabel(input)}</b>
+            </header>
+            <InputContent input={input} />
+          </article>
+        ))}
+        {loading && <div className="section-loading">Loading inputs…</div>}
+        {error && <button className="section-retry" onClick={() => void loadMore()}>{error} · Retry</button>}
+        {!loading && !error && inputs.length > 0 && !hasMore && <div className="detail-empty">All inputs loaded</div>}
+      </div>}
     </details>
   )
 }
@@ -693,19 +790,34 @@ function reasoningText(summary: unknown): string {
   return typeof record?.text === 'string' ? record.text : formatValue(summary)
 }
 
-function TokenUsageSection({ usage }: { usage: Record<string, unknown> }) {
+function TokenUsageSection({ usage, loading, error, onOpen }: {
+  usage: Record<string, unknown>
+  loading: boolean
+  error: string
+  onOpen: () => void
+}) {
+  const [open, setOpen] = useState(false)
   const cost = tokenCostBreakdown(usage)
   return (
-    <details className="token-usage-section wide" open>
+    <details
+      className="token-usage-section wide"
+      open={open}
+      onToggle={(event) => {
+        setOpen(event.currentTarget.open)
+        if (event.currentTarget.open) onOpen()
+      }}
+    >
       <summary>Token usage</summary>
-      <div className="token-focus-grid">
-        <TokenMetric label="Uncached input tokens" value={cost.uncachedInputTokens} tone="input" />
-        <TokenMetric label="Output tokens" value={cost.outputTokens} tone="output" />
-        <TokenMetric label="Cached tokens" value={cost.cachedTokens} tone="cached" />
-        <TokenMetric label="Weighted cost" value={cost.weightedCost} tone="cost" />
-      </div>
-      <div className="token-formula">output × 100 + cached + uncached input × 50</div>
-      <pre>{formatValue(usage)}</pre>
+      {open && <SectionContent loading={loading} error={error}>
+        <div className="token-focus-grid">
+          <TokenMetric label="Uncached input tokens" value={cost.uncachedInputTokens} tone="input" />
+          <TokenMetric label="Output tokens" value={cost.outputTokens} tone="output" />
+          <TokenMetric label="Cached tokens" value={cost.cachedTokens} tone="cached" />
+          <TokenMetric label="Weighted cost" value={cost.weightedCost} tone="cost" />
+        </div>
+        <div className="token-formula">output × 100 + cached + uncached input × 50</div>
+        <pre>{formatValue(usage)}</pre>
+      </SectionContent>}
     </details>
   )
 }
@@ -714,8 +826,36 @@ function TokenMetric({ label, value, tone }: { label: string; value: number; ton
   return <div className={`token-metric ${tone}`}><span>{label}</span><strong>{value.toLocaleString()}</strong></div>
 }
 
-function JsonSection({ title, value, wide = false }: { title: string; value: unknown; wide?: boolean }) {
-  return <details className={wide ? 'wide' : ''} open={title === 'System prompt' || title === 'Additional data'}><summary>{title}</summary><pre>{formatValue(value)}</pre></details>
+function JsonSection({ title, value, wide = false, loading, error, onOpen }: {
+  title: string
+  value: unknown
+  wide?: boolean
+  loading: boolean
+  error: string
+  onOpen: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  return <details
+    className={wide ? 'wide' : ''}
+    open={open}
+    onToggle={(event) => {
+      setOpen(event.currentTarget.open)
+      if (event.currentTarget.open) onOpen()
+    }}
+  >
+    <summary>{title}</summary>
+    {open && <SectionContent loading={loading} error={error}><pre>{formatValue(value)}</pre></SectionContent>}
+  </details>
+}
+
+function SectionContent({ loading, error, children }: {
+  loading: boolean
+  error: string
+  children: ReactNode
+}) {
+  if (loading) return <div className="section-loading">Loading span details…</div>
+  if (error) return <div className="section-error">{error}</div>
+  return <>{children}</>
 }
 
 function Metric({ label, value }: { label: string; value: string }) {

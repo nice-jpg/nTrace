@@ -2,7 +2,26 @@ import type { TraceEvent, TraceSpan } from './types'
 
 export const LABEL_WIDTH = 188
 export const AGENT_HEIGHT = 104
+export const COLLAPSED_AGENT_HEIGHT = 40
 export const RULER_HEIGHT = 46
+
+export interface AgentRowLayout {
+  agentId: number
+  top: number
+  height: number
+  collapsed: boolean
+}
+
+export function layoutAgentRows(agentIds: number[], collapsedAgentIds: Set<number>): AgentRowLayout[] {
+  let top = 0
+  return agentIds.map((agentId) => {
+    const collapsed = collapsedAgentIds.has(agentId)
+    const height = collapsed ? COLLAPSED_AGENT_HEIGHT : AGENT_HEIGHT
+    const layout = { agentId, top, height, collapsed }
+    top += height
+    return layout
+  })
+}
 
 export function assembleSpans(events: TraceEvent[]): TraceSpan[] {
   const pairs = new Map<number, { start?: TraceEvent; end?: TraceEvent }>()
@@ -181,7 +200,7 @@ export function childConnectorSpans(spans: TraceSpan[]): TraceSpan[] {
   for (const span of [...spans].sort(
     (a, b) => Date.parse(a.started_at) - Date.parse(b.started_at) || a.span_id - b.span_id,
   )) {
-    if (span.sender !== 'host' || span.parent_span_id === null || span.parent_agent_id !== 1) continue
+    if (span.sender !== 'host' || span.parent_span_id === null || span.parent_agent_id === null) continue
     if (!firstByChild.has(span.agent_id)) firstByChild.set(span.agent_id, span)
   }
   return [...firstByChild.values()]

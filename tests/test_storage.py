@@ -85,6 +85,36 @@ def test_timeline_omits_heavy_payload_and_span_detail_loads_it_on_demand(tmp_pat
     assert span["system_prompt"] == "large-system"
     assert span["output"] == "large-output"
     assert span["tool_call_results"] == [{"content": "large-result"}]
+
+    details = storage.get_span_details(101, 201)
+    assert details is not None
+    assert details["system_prompt"] == "large-system"
+    assert "user_inputs" not in details
+    assert "start_event" not in details
+    assert "end_event" not in details
+    storage.close()
+
+
+def test_span_user_inputs_are_paged_newest_first(tmp_path) -> None:
+    storage = TraceStorage(tmp_path / "trace.sqlite3")
+    storage.put_events([event("start", user_inputs=[f"input-{index}" for index in range(25)])])
+
+    first = storage.get_span_user_inputs(101, 201)
+    assert first == {
+        "items": [f"input-{index}" for index in range(24, 14, -1)],
+        "offset": 0,
+        "limit": 10,
+        "total": 25,
+        "has_more": True,
+    }
+    last = storage.get_span_user_inputs(101, 201, offset=20, limit=10)
+    assert last == {
+        "items": [f"input-{index}" for index in range(4, -1, -1)],
+        "offset": 20,
+        "limit": 10,
+        "total": 25,
+        "has_more": False,
+    }
     storage.close()
 
 

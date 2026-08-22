@@ -26,7 +26,20 @@ def test_api_persists_lists_and_streams_events(tmp_path) -> None:
         assert "system_prompt" not in timeline["events"][0]
         span = client.get("/api/v1/traces/101/spans/201").json()
         assert span["system_prompt"] == "system"
+        span_details = client.get("/api/v1/traces/101/spans/201/details").json()
+        assert span_details["system_prompt"] == "system"
+        assert "user_inputs" not in span_details
+        inputs = client.get("/api/v1/traces/101/spans/201/user-inputs?offset=0&limit=10").json()
+        assert inputs == {
+            "items": ["hello"],
+            "offset": 0,
+            "limit": 10,
+            "total": 1,
+            "has_more": False,
+        }
         assert client.get("/api/v1/traces/999").status_code == 404
+        assert client.get("/api/v1/traces/999/spans/201/details").status_code == 404
+        assert client.get("/api/v1/traces/999/spans/201/user-inputs").status_code == 404
 
 
 def test_api_deletes_trace_and_broadcasts_removal(tmp_path) -> None:

@@ -7,6 +7,7 @@ import {
   decodeEscapedText,
   formatTickLabel,
   latestEventTime,
+  layoutAgentRows,
   layoutSpan,
   tokenColor,
   tokenCostBreakdown,
@@ -122,7 +123,7 @@ describe('trace timeline math', () => {
     })
   })
 
-  it('draws only the first main-agent connector for each child agent', () => {
+  it('draws the first connector for every derived agent, including nested agents', () => {
     const events = [
       event('start', { span_id: 10 }),
       event('end', { span_id: 10 }),
@@ -155,7 +156,15 @@ describe('trace timeline math', () => {
         timestamp: '2026-01-01T00:00:04.000Z',
       }),
     ]
-    expect(childConnectorSpans(assembleSpans(events)).map((span) => span.span_id)).toEqual([20])
+    expect(childConnectorSpans(assembleSpans(events)).map((span) => span.span_id)).toEqual([20, 30])
+  })
+
+  it('compacts collapsed agent rows while preserving their layout position', () => {
+    expect(layoutAgentRows([1, 2, 3], new Set([2]))).toEqual([
+      { agentId: 1, top: 0, height: 104, collapsed: false },
+      { agentId: 2, top: 104, height: 40, collapsed: true },
+      { agentId: 3, top: 144, height: 104, collapsed: false },
+    ])
   })
 
   it('renders escaped user input text as readable multiline content', () => {

@@ -19,7 +19,7 @@ cd nTrace/frontend
 npm install
 npm run build
 cd ../..
-/Users/nice/Env/anaconda3/envs/bines/bin/python -m nTrace.server
+python -m nTrace.server
 ```
 
 Open [http://127.0.0.1:8765](http://127.0.0.1:8765). The service binds only to
@@ -64,9 +64,11 @@ already-built agent. The compiled agent itself remains unwrapped and privately o
 single active `NTrace` instance.
 
 The event receiver accepts a single event or `{ "events": [...] }` at
-`POST /api/v1/events`. History is available from `GET /api/v1/traces`, a complete
-snapshot from `GET /api/v1/traces/{trace_id}`, and live updates from
-`WS /api/v1/stream`.
+`POST /api/v1/events`. History is available from `GET /api/v1/traces`; the lightweight
+timeline uses `GET /api/v1/traces/{trace_id}/timeline`. Non-input span details load from
+`GET /api/v1/traces/{trace_id}/spans/{span_id}/details`, while user inputs are paged
+newest-first through `GET /api/v1/traces/{trace_id}/spans/{span_id}/user-inputs`.
+Live updates use `WS /api/v1/stream`.
 
 ## Tests
 

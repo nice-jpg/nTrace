@@ -379,6 +379,45 @@ class TraceStorage:
         spans = assemble_spans([json.loads(row["payload_json"]) for row in rows])
         return spans[0] if spans else None
 
+    def get_span_details(self, trace_id: int, span_id: int) -> dict[str, Any] | None:
+        """Return non-input span fields loaded by the expandable detail sections."""
+
+        span = self.get_span(trace_id, span_id)
+        if span is None:
+            return None
+        return {
+            key: value
+            for key, value in span.items()
+            if key not in {"user_inputs", "start_event", "end_event"}
+        }
+
+    def get_span_user_inputs(
+        self,
+        trace_id: int,
+        span_id: int,
+        *,
+        offset: int = 0,
+        limit: int = 10,
+    ) -> dict[str, Any] | None:
+        """Page user inputs newest-first so older items can be appended on scroll."""
+
+        span = self.get_span(trace_id, span_id)
+        if span is None:
+            return None
+        raw_inputs = span.get("user_inputs")
+        inputs = raw_inputs if isinstance(raw_inputs, list) else []
+        newest_first = list(reversed(inputs))
+        start = max(0, int(offset))
+        size = max(1, min(100, int(limit)))
+        items = newest_first[start:start + size]
+        return {
+            "items": items,
+            "offset": start,
+            "limit": size,
+            "total": len(inputs),
+            "has_more": start + len(items) < len(inputs),
+        }
+
     def delete_trace(self, trace_id: int) -> bool:
         with self._lock, self._connection:
             cursor = self._connection.execute(

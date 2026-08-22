@@ -142,6 +142,30 @@ def create_app(
             raise HTTPException(status_code=404, detail="Span not found")
         return span
 
+    @app.get("/api/v1/traces/{trace_id}/spans/{span_id}/details")
+    async def get_span_details(trace_id: int, span_id: int) -> dict[str, Any]:
+        span = storage.get_span_details(trace_id, span_id)
+        if span is None:
+            raise HTTPException(status_code=404, detail="Span not found")
+        return span
+
+    @app.get("/api/v1/traces/{trace_id}/spans/{span_id}/user-inputs")
+    async def get_span_user_inputs(
+        trace_id: int,
+        span_id: int,
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=10, ge=1, le=100),
+    ) -> dict[str, Any]:
+        page = storage.get_span_user_inputs(
+            trace_id,
+            span_id,
+            offset=offset,
+            limit=limit,
+        )
+        if page is None:
+            raise HTTPException(status_code=404, detail="Span not found")
+        return page
+
     @app.delete("/api/v1/traces/{trace_id}")
     async def delete_trace(trace_id: int) -> dict[str, int]:
         if not storage.delete_trace(trace_id):
