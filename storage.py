@@ -162,25 +162,19 @@ class TraceStorage:
             )
             parent = None
             if not starts_user_turn:
-                parent = self._connection.execute(
-                    """
-                    SELECT start.trace_id, start.span_id, start.agent_id
-                    FROM events AS start
-                    LEFT JOIN events AS finish
-                      ON finish.trace_id=start.trace_id
-                     AND finish.span_id=start.span_id
-                     AND finish.event_type='end'
-                    WHERE start.sender='host'
-                      AND start.event_type='start'
-                      AND start.timestamp <= ?
-                      AND finish.span_id IS NULL
-                    ORDER BY start.timestamp DESC, start.rowid DESC
-                    LIMIT 1
-                    """,
-                    (timestamp,),
-                ).fetchone()
-                if parent is None:
-                    parent = self._latest_tool_call_parent(timestamp)
+                candidates = [
+                    candidate
+                    for candidate in (
+                        self._latest_unfinished_host_parent(timestamp),
+                        self._latest_tool_call_parent(timestamp),
+                    )
+                    if candidate is not None
+                ]
+                parent = max(
+                    candidates,
+                    key=lambda candidate: _parse_time(str(candidate["candidate_at"])),
+                    default=None,
+                )
             if parent is None:
                 root_trace_id = source_trace_id
                 parent_span_id = None
@@ -235,7 +229,30 @@ class TraceStorage:
             event["parent_span_id"] = context["parent_span_id"]
         return event
 
-    def _latest_tool_call_parent(self, timestamp: str) -> dict[str, int] | None:
+    def _latest_unfinished_host_parent(self, timestamp: str) -> dict[str, Any] | None:
+        """Return the newest genuinely active host candidate before ``timestamp``."""
+
+        row = self._connection.execute(
+            """
+            SELECT start.trace_id, start.span_id, start.agent_id,
+                   start.timestamp AS candidate_at
+            FROM events AS start
+            LEFT JOIN events AS finish
+              ON finish.trace_id=start.trace_id
+             AND finish.span_id=start.span_id
+             AND finish.event_type='end'
+            WHERE start.sender='host'
+              AND start.event_type='start'
+              AND start.timestamp <= ?
+              AND finish.span_id IS NULL
+            ORDER BY start.timestamp DESC, start.rowid DESC
+            LIMIT 1
+            """,
+            (timestamp,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _latest_tool_call_parent(self, timestamp: str) -> dict[str, Any] | None:
         """Find the host span whose model response most recently started a tool."""
 
         rows = self._connection.execute(
@@ -260,6 +277,7 @@ class TraceStorage:
                     "trace_id": int(row["trace_id"]),
                     "span_id": int(parent_span_id),
                     "agent_id": int(row["agent_id"]),
+                    "candidate_at": str(payload["timestamp"]),
                 }
         return None
 
@@ -468,7 +486,26 @@ def assemble_spans(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "end_event": end,
             }
         )
-    return sorted(spans, key=lambda span: (str(span.get("started_at") or ""), int(span["span_id"])))
+    spans.sort(key=lambda span: (str(span.get("started_at") or ""), int(span["span_id"])))
+    previous_by_lane: dict[tuple[int, str], dict[str, Any]] = {}
+    for span in spans:
+        lane = (int(span.get("agent_id") or 0), str(span.get("sender") or ""))
+        previous = previous_by_lane.get(lane)
+        next_started_at = span.get("started_at")
+        if previous is not None and previous["running"] and next_started_at:
+            previous_started_at = previous.get("started_at")
+            previous["ended_at"] = next_started_at
+            previous["running"] = False
+            if previous_started_at:
+                try:
+                    previous["duration_ms"] = max(
+                        0.0,
+                        (_parse_time(next_started_at) - _parse_time(previous_started_at)).total_seconds() * 1000,
+                    )
+                except ValueError:
+                    previous["duration_ms"] = None
+        previous_by_lane[lane] = span
+    return spans
 
 
 def _parse_time(value: str) -> datetime:

@@ -53,6 +53,17 @@ describe('trace timeline math', () => {
     expect(assembleSpans([event('start')])[0].running).toBe(true)
   })
 
+  it('bounds an unfinished lane span at the next span start', () => {
+    const spans = assembleSpans([
+      event('start', { span_id: 2, timestamp: '2026-01-01T00:00:00.000Z' }),
+      event('start', { span_id: 3, timestamp: '2026-01-01T00:00:05.000Z' }),
+      event('end', { span_id: 3, timestamp: '2026-01-01T00:00:06.000Z' }),
+    ])
+    expect(spans[0].ended_at).toBe('2026-01-01T00:00:05.000Z')
+    expect(spans[0].duration_ms).toBe(5_000)
+    expect(spans[0].running).toBe(false)
+  })
+
   it('freezes the timeline at the latest event until another event arrives', () => {
     const start = event('start')
     expect(latestEventTime([start], Date.parse(start.timestamp))).toBe(Date.parse(start.timestamp))

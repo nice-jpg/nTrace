@@ -52,7 +52,23 @@ export function assembleSpans(events: TraceEvent[]): TraceSpan[] {
       end_event: pair.end ?? null,
     })
   }
-  return spans.sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at) || a.span_id - b.span_id)
+  spans.sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at) || a.span_id - b.span_id)
+  const previousByLane = new Map<string, TraceSpan>()
+  for (const span of spans) {
+    const lane = `${span.agent_id}:${span.sender}`
+    const previous = previousByLane.get(lane)
+    if (previous?.running) {
+      const previousStart = Date.parse(previous.started_at)
+      const nextStart = Date.parse(span.started_at)
+      previous.ended_at = span.started_at
+      previous.duration_ms = Number.isFinite(previousStart) && Number.isFinite(nextStart)
+        ? Math.max(0, nextStart - previousStart)
+        : null
+      previous.running = false
+    }
+    previousByLane.set(lane, span)
+  }
+  return spans
 }
 
 export function upsertEvent(events: TraceEvent[], incoming: TraceEvent): TraceEvent[] {

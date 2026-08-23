@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nTrace.storage import TraceStorage
+from nTrace.storage import TraceStorage, assemble_spans
 
 
 def event(event_type="start", **overrides):
@@ -262,3 +262,57 @@ def test_server_links_child_after_parent_host_span_has_ended(tmp_path) -> None:
     assert child["agent_id"] == 2
     assert child["parent_span_id"] == 201
     storage.close()
+
+
+def test_newer_tool_call_beats_stale_unfinished_host_when_linking_child(tmp_path) -> None:
+    storage = TraceStorage(tmp_path / "trace.sqlite3")
+    stored = storage.put_events(
+        [
+            event("start", trace_id=101, span_id=201, timestamp="2026-01-01T00:00:00.000Z"),
+            event(
+                "start",
+                trace_id=201,
+                span_id=401,
+                timestamp="2026-01-01T00:00:10.000Z",
+                data={"trace_boundary": "user_input", "session_id": "new-turn"},
+            ),
+            event("end", trace_id=201, span_id=401, timestamp="2026-01-01T00:00:10.100Z"),
+            event(
+                "end",
+                trace_id=201,
+                span_id=402,
+                parent_span_id=401,
+                sender="llm",
+                timestamp="2026-01-01T00:00:11.000Z",
+                tools_called=[{"name": "prepare_collector", "args": {}}],
+            ),
+            event(
+                "start",
+                trace_id=202,
+                span_id=501,
+                agent_name="collector",
+                timestamp="2026-01-01T00:00:11.100Z",
+            ),
+        ]
+    )
+
+    child = stored[-1]
+    assert child["trace_id"] == 201
+    assert child["parent_span_id"] == 401
+    assert child["parent_agent_id"] == 1
+    assert storage.get_trace(201)["agents"][-1]["agent_name"] == "collector"
+    storage.close()
+
+
+def test_next_lane_start_implicitly_bounds_an_unfinished_span() -> None:
+    spans = assemble_spans(
+        [
+            event("start", span_id=201, timestamp="2026-01-01T00:00:00.000Z"),
+            event("start", span_id=202, timestamp="2026-01-01T00:00:05.000Z"),
+            event("end", span_id=202, timestamp="2026-01-01T00:00:06.000Z"),
+        ]
+    )
+
+    assert spans[0]["ended_at"] == "2026-01-01T00:00:05.000Z"
+    assert spans[0]["duration_ms"] == 5000
+    assert spans[0]["running"] is False
