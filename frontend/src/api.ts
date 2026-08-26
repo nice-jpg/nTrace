@@ -1,15 +1,25 @@
-import type { TraceDetail, TraceEvent, TraceSpan, TraceSummary } from './types'
+import type { AgentTokenStatistics, TraceDetail, TraceEvent, TraceListItem, TraceSpan } from './types'
 
-export async function fetchTraces(): Promise<TraceSummary[]> {
+export async function fetchTraces(): Promise<TraceListItem[]> {
   const response = await fetch('/api/v1/traces')
   if (!response.ok) throw new Error(`Unable to load traces (${response.status})`)
   return (await response.json()).traces
 }
 
+export async function fetchAgentTokenStatistics(
+  traceId: number,
+  agentId: number,
+): Promise<AgentTokenStatistics> {
+  const response = await fetch(`/api/v1/traces/${traceId}/agents/${agentId}/token-stats`)
+  if (!response.ok) throw new Error(`Unable to load token statistics (${response.status})`)
+  return response.json()
+}
+
 export async function fetchTrace(traceId: number): Promise<TraceDetail> {
   const response = await fetch(`/api/v1/traces/${traceId}/timeline`)
   if (!response.ok) throw new Error(`Unable to load trace (${response.status})`)
-  return response.json()
+  const timeline = await response.json() as Omit<TraceDetail, 'events'>
+  return { ...timeline, events: [] }
 }
 
 export async function fetchSpan(traceId: number, spanId: number): Promise<TraceSpan> {
@@ -46,7 +56,7 @@ export async function deleteTrace(traceId: number): Promise<void> {
 
 export function openTraceStream(
   onEvent: (event: TraceEvent) => void,
-  onReady: () => void,
+  onReady: (reconnected: boolean) => void,
   onDeleted: (traceId: number) => void,
 ): () => void {
   let socket: WebSocket | null = null
@@ -57,8 +67,9 @@ export function openTraceStream(
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
     socket = new WebSocket(`${protocol}//${location.host}/api/v1/stream`)
     socket.onopen = () => {
+      const reconnected = retry > 0
       retry = 0
-      onReady()
+      onReady(reconnected)
     }
     socket.onmessage = (message) => {
       const payload = JSON.parse(message.data)

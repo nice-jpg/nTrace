@@ -19,11 +19,13 @@ def test_api_persists_lists_and_streams_events(tmp_path) -> None:
             assert streamed["event"]["span_id"] == 201
 
         traces = client.get("/api/v1/traces").json()["traces"]
-        assert traces[0]["trace_id"] == 101
+        assert traces == [{"trace_id": 101}]
         detail = client.get("/api/v1/traces/101").json()
         assert detail["spans"][0]["running"] is True
         timeline = client.get("/api/v1/traces/101/timeline").json()
-        assert "system_prompt" not in timeline["events"][0]
+        assert "events" not in timeline
+        assert "system_prompt" not in timeline["spans"][0]
+        assert "token_usage" not in timeline["spans"][0]
         span = client.get("/api/v1/traces/101/spans/201").json()
         assert span["system_prompt"] == "system"
         span_details = client.get("/api/v1/traces/101/spans/201/details").json()
@@ -40,6 +42,10 @@ def test_api_persists_lists_and_streams_events(tmp_path) -> None:
         assert client.get("/api/v1/traces/999").status_code == 404
         assert client.get("/api/v1/traces/999/spans/201/details").status_code == 404
         assert client.get("/api/v1/traces/999/spans/201/user-inputs").status_code == 404
+        stats = client.get("/api/v1/traces/101/agents/1/token-stats")
+        assert stats.status_code == 200
+        assert stats.json()["agentId"] == 1
+        assert client.get("/api/v1/traces/101/agents/999/token-stats").status_code == 404
 
 
 def test_api_deletes_trace_and_broadcasts_removal(tmp_path) -> None:
@@ -89,4 +95,5 @@ def test_stream_broadcasts_server_inferred_child_context(tmp_path) -> None:
         assert streamed["agent_id"] == 2
         assert streamed["parent_agent_id"] == 1
         assert streamed["parent_span_id"] == 201
-        assert streamed["data"]["source_trace_id"] == 102
+        assert "data" not in streamed
+        assert "token_usage" not in streamed

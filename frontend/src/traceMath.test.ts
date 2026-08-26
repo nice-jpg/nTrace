@@ -13,6 +13,7 @@ import {
   tokenColor,
   tokenCostBreakdown,
   upsertEvent,
+  upsertTimelineSpan,
 } from './traceMath'
 import type { AgentSummary, TraceEvent } from './types'
 
@@ -226,5 +227,25 @@ describe('trace timeline math', () => {
     const updated = upsertEvent([event('start')], event('start', { user_inputs: ['updated'] }))
     expect(updated).toHaveLength(1)
     expect(updated[0].user_inputs).toEqual(['updated'])
+  })
+
+  it('merges live events into a lightweight timeline without a snapshot event payload', () => {
+    const snapshot = assembleSpans([event('start'), event('end')]).map((span) => ({
+      ...span,
+      start_event: null,
+      end_event: null,
+    }))
+    const updated = upsertTimelineSpan(snapshot, event('start', {
+      span_id: 3,
+      timestamp: '2026-01-01T00:00:12.000Z',
+    }))
+    expect(updated).toHaveLength(2)
+    expect(updated[1].running).toBe(true)
+    const completed = upsertTimelineSpan(updated, event('end', {
+      span_id: 3,
+      timestamp: '2026-01-01T00:00:13.500Z',
+    }))
+    expect(completed[1].duration_ms).toBe(1500)
+    expect(completed[1].running).toBe(false)
   })
 })

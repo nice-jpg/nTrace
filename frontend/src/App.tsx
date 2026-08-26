@@ -1,28 +1,45 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
-import { deleteTrace as deleteTraceRequest, fetchSpan, fetchTrace, fetchTraces, fetchUserInputs, openTraceStream } from './api'
+import type { EChartsOption } from 'echarts'
+import {
+  deleteTrace as deleteTraceRequest,
+  fetchAgentTokenStatistics,
+  fetchSpan,
+  fetchTrace,
+  fetchTraces,
+  fetchUserInputs,
+  openTraceStream,
+} from './api'
 import {
   LABEL_WIDTH,
   RULER_HEIGHT,
-  agentTokenStatistics,
-  assembleSpans,
   centeredZoomScrollLeft,
   childConnectorSpans,
   clampDrawerHeight,
   decodeEscapedText,
   formatDuration,
   formatTickLabel,
-  latestEventTime,
   layoutAgentRows,
   layoutSpan,
   tokenColor,
   tokenCost,
   tokenCostBreakdown,
+  upsertTimelineSpan,
   upsertEvent,
 } from './traceMath'
-import type { AgentSummary, TraceDetail, TraceEvent, TraceSpan, TraceSummary } from './types'
-import type { AgentRowLayout, TokenStatPoint } from './traceMath'
+import type {
+  AgentSummary,
+  AgentTokenStatistics,
+  TokenStatPoint,
+  TraceDetail,
+  TraceEvent,
+  TraceListItem,
+  TraceSpan,
+} from './types'
+import type { AgentRowLayout } from './traceMath'
 import { getCachedTrace, putCachedTrace } from './traceCache'
+
+const ReactECharts = lazy(() => import('./TokenChartRenderer'))
 
 const Icon = ({ name }: { name: 'trace' | 'activity' | 'chevron' | 'copy' | 'close' }) => {
   const paths = {
@@ -42,19 +59,28 @@ interface SpanSelection {
   error: string
 }
 
+interface AgentStatsSelection {
+  data: AgentTokenStatistics | null
+  loading: boolean
+  error: string
+}
+
 export default function App() {
-  const [traces, setTraces] = useState<TraceSummary[]>([])
+  const [traces, setTraces] = useState<TraceListItem[]>([])
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [detail, setDetail] = useState<TraceDetail | null>(null)
   const [selectedSpan, setSelectedSpan] = useState<SpanSelection | null>(null)
   const [selectedAgentId, setSelectedAgentId] = useState<number | null>(null)
+  const [agentStats, setAgentStats] = useState<AgentStatsSelection | null>(null)
   const [historyOpen, setHistoryOpen] = useState(true)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState('')
   const selectedIdRef = useRef<number | null>(null)
   const traceCacheRef = useRef(new Map<number, TraceDetail>())
   const spanCacheRef = useRef(new Map<number, Map<number, TraceSpan>>())
+  const statsCacheRef = useRef(new Map<number, Map<number, AgentTokenStatistics>>())
   const spanRequestRef = useRef(0)
+  const statsRequestRef = useRef(0)
 
   useEffect(() => { selectedIdRef.current = selectedId }, [selectedId])
 
@@ -62,7 +88,6 @@ export default function App() {
     try {
       const next = await fetchTraces()
       setTraces(next)
-      setSelectedId((current) => current ?? next[0]?.trace_id ?? null)
       setError('')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))
@@ -71,7 +96,10 @@ export default function App() {
 
   const cacheTrace = useCallback((trace: TraceDetail) => {
     const evicted = putCachedTrace(traceCacheRef.current, trace)
-    evicted.forEach((traceId) => spanCacheRef.current.delete(traceId))
+    evicted.forEach((traceId) => {
+      spanCacheRef.current.delete(traceId)
+      statsCacheRef.current.delete(traceId)
+    })
   }, [])
 
   const refreshSelected = useCallback(async (
@@ -103,9 +131,12 @@ export default function App() {
   const removeTraceLocally = useCallback((traceId: number) => {
     traceCacheRef.current.delete(traceId)
     spanCacheRef.current.delete(traceId)
+    statsCacheRef.current.delete(traceId)
     setTraces((current) => current.filter((trace) => trace.trace_id !== traceId))
     if (selectedIdRef.current === traceId) {
       setSelectedSpan(null)
+      setSelectedAgentId(null)
+      setAgentStats(null)
       setDetail(null)
       setSelectedId(null)
       void refreshTraces()
@@ -167,13 +198,50 @@ export default function App() {
 
   useEffect(() => { void refreshTraces() }, [refreshTraces])
   useEffect(() => { void refreshSelected(selectedId) }, [selectedId, refreshSelected])
+  useEffect(() => {
+    if (!selectedSpan || selectedSpan.detail || selectedSpan.loading) return
+    void loadSpanDetails(selectedSpan.timeline)
+  }, [loadSpanDetails, selectedSpan])
+
+  useEffect(() => {
+    if (selectedId === null || selectedAgentId === null) {
+      setAgentStats(null)
+      return
+    }
+    const cached = statsCacheRef.current.get(selectedId)?.get(selectedAgentId)
+    if (cached) {
+      setAgentStats({ data: cached, loading: false, error: '' })
+      return
+    }
+    const requestId = ++statsRequestRef.current
+    setAgentStats({ data: null, loading: true, error: '' })
+    void fetchAgentTokenStatistics(selectedId, selectedAgentId).then((statistics) => {
+      let traceStats = statsCacheRef.current.get(selectedId)
+      if (!traceStats) {
+        traceStats = new Map()
+        statsCacheRef.current.set(selectedId, traceStats)
+      }
+      traceStats.set(selectedAgentId, statistics)
+      if (requestId === statsRequestRef.current) {
+        setAgentStats({ data: statistics, loading: false, error: '' })
+      }
+    }).catch((reason) => {
+      if (requestId === statsRequestRef.current) {
+        setAgentStats({
+          data: null,
+          loading: false,
+          error: reason instanceof Error ? reason.message : String(reason),
+        })
+      }
+    })
+  }, [selectedAgentId, selectedId])
 
   useEffect(() => openTraceStream(
     (event) => {
       setConnected(true)
-      setTraces((current) => updateTraceSummaries(current, event))
-      if (selectedIdRef.current === null) setSelectedId(event.trace_id)
+      setTraces((current) => updateTraceList(current, event))
       spanCacheRef.current.get(event.trace_id)?.delete(event.span_id)
+      statsCacheRef.current.delete(event.trace_id)
       const cached = traceCacheRef.current.get(event.trace_id)
       const cachedUpdate = cached ? mergeLiveEvent(cached, event) : null
       if (cachedUpdate) traceCacheRef.current.set(event.trace_id, cachedUpdate)
@@ -182,10 +250,10 @@ export default function App() {
         return cachedUpdate ?? mergeLiveEvent(current, event)
       })
     },
-    () => {
+    (reconnected) => {
       setConnected(true)
       void refreshTraces()
-      void refreshSelected(undefined, true)
+      if (reconnected) void refreshSelected(undefined, true)
     },
     removeTraceLocally,
   ), [refreshSelected, refreshTraces, removeTraceLocally])
@@ -207,7 +275,12 @@ export default function App() {
         traces={traces}
         selectedId={selectedId}
         onToggle={() => setHistoryOpen((value) => !value)}
-        onSelect={(id) => { setSelectedId(id); setSelectedAgentId(null); clearSelectedSpan() }}
+        onSelect={(id) => {
+          setSelectedId(id)
+          setSelectedAgentId(null)
+          setAgentStats(null)
+          clearSelectedSpan()
+        }}
         onDelete={(id) => void deleteTrace(id)}
       />
 
@@ -240,8 +313,9 @@ export default function App() {
             <AgentStatsPanel
               agent={detail.agents.find((agent) => agent.agent_id === selectedAgentId)!}
               trace={detail}
+              statistics={agentStats}
               onSelectSpan={selectSpan}
-              onClose={() => setSelectedAgentId(null)}
+              onClose={() => { setSelectedAgentId(null); setAgentStats(null) }}
             />
           )}
         </div>}
@@ -264,7 +338,7 @@ function HistoryPanel({
   open, traces, selectedId, onToggle, onSelect, onDelete,
 }: {
   open: boolean
-  traces: TraceSummary[]
+  traces: TraceListItem[]
   selectedId: number | null
   onToggle: () => void
   onSelect: (traceId: number) => void
@@ -309,12 +383,6 @@ function HistoryPanel({
           >
             <div className="history-card-top">
               <code>#{shortId(trace.trace_id)}</code>
-              <Status status={trace.status} compact />
-            </div>
-            <time>{new Date(trace.started_at).toLocaleString()}</time>
-            <div className="history-counts">
-              <span>{trace.agent_count} agents</span>
-              <span>{trace.span_count} spans</span>
             </div>
           </button>
         ))}
@@ -371,7 +439,10 @@ function Timeline({ trace, selectedAgentId, selectedSpanId, onSelectAgent, onSel
   const rowsHeight = rowLayouts.reduce((height, row) => height + row.height, 0)
   const spans = trace.spans
   const startMs = Math.min(...spans.map((span) => Date.parse(span.started_at)), Date.parse(trace.started_at))
-  const latestMs = latestEventTime(trace.events, startMs)
+  const latestMs = Math.max(
+    startMs,
+    ...spans.flatMap((span) => [Date.parse(span.started_at), span.ended_at ? Date.parse(span.ended_at) : Number.NEGATIVE_INFINITY]),
+  )
   const durationMs = Math.max(1_000, latestMs - startMs)
   const contentViewport = Math.max(320, viewportWidth - LABEL_WIDTH)
   const fitPixelsPerMs = contentViewport / durationMs
@@ -627,16 +698,15 @@ function ConnectorLayer({ rowLayouts, spans, connectors, startMs, pixelsPerMs, w
   )
 }
 
-function AgentStatsPanel({ agent, trace, onSelectSpan, onClose }: {
+function AgentStatsPanel({ agent, trace, statistics, onSelectSpan, onClose }: {
   agent: AgentSummary
   trace: TraceDetail
+  statistics: AgentStatsSelection | null
   onSelectSpan: (span: TraceSpan) => void
   onClose: () => void
 }) {
-  const statistics = useMemo(
-    () => agentTokenStatistics(agent.agent_id, trace.agents, trace.spans),
-    [agent.agent_id, trace.agents, trace.spans],
-  )
+  const [panelWidth, setPanelWidth] = useState(() => Math.min(380, window.innerWidth * 0.32))
+  const resizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null)
   const spanById = useMemo(
     () => new Map(trace.spans.map((span) => [span.span_id, span])),
     [trace.spans],
@@ -645,127 +715,243 @@ function AgentStatsPanel({ agent, trace, onSelectSpan, onClose }: {
     const span = spanById.get(point.spanId)
     if (span) onSelectSpan(span)
   }
-  const llmCost = statistics.llmCalls.reduce((sum, point) => sum + point.weightedCost, 0)
-  const subagentCost = statistics.subagentCalls.reduce((sum, point) => sum + point.weightedCost, 0)
+  const data = statistics?.data
+  const llmCost = data?.llmCalls.reduce((sum, point) => sum + point.weightedCost, 0) ?? 0
+  const subagentCost = data?.subagentCalls.reduce((sum, point) => sum + point.weightedCost, 0) ?? 0
+  const clampPanelWidth = (width: number) => Math.max(300, Math.min(window.innerWidth * 0.68, width))
+  const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    resizeRef.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: panelWidth }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    document.body.classList.add('resizing-stats-panel')
+    event.preventDefault()
+  }
+  const resize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = resizeRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
+    setPanelWidth(clampPanelWidth(drag.startWidth + drag.startX - event.clientX))
+  }
+  const stopResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (resizeRef.current?.pointerId !== event.pointerId) return
+    resizeRef.current = null
+    document.body.classList.remove('resizing-stats-panel')
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+  }
 
   return (
-    <aside className="agent-stats-panel" aria-label={`Token statistics for agent ${agent.agent_name}`}>
+    <aside
+      className="agent-stats-panel"
+      style={{ flexBasis: panelWidth }}
+      aria-label={`Token statistics for agent ${agent.agent_name}`}
+    >
+      <div
+        className="stats-panel-resizer"
+        role="separator"
+        aria-label="Resize token statistics panel"
+        aria-orientation="vertical"
+        tabIndex={0}
+        onPointerDown={startResize}
+        onPointerMove={resize}
+        onPointerUp={stopResize}
+        onPointerCancel={stopResize}
+        onKeyDown={(event) => {
+          if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+          setPanelWidth((current) => clampPanelWidth(current + (event.key === 'ArrowLeft' ? 48 : -48)))
+          event.preventDefault()
+        }}
+      ><span /></div>
       <header className="drawer-header stats-header">
         <div>
           <span className="sender-chip host">Agent</span>
           <h2>{agent.agent_name}<small>token statistics</small></h2>
         </div>
         <div className="drawer-actions">
+          <button onClick={() => setPanelWidth((current) => clampPanelWidth(current - 64))} aria-label="Narrow token statistics panel">−</button>
+          <button onClick={() => setPanelWidth((current) => clampPanelWidth(current + 64))} aria-label="Widen token statistics panel">+</button>
           <button className="icon-button" onClick={onClose} aria-label="Close agent statistics"><Icon name="close" /></button>
         </div>
       </header>
-      <div className="drawer-summary stats-summary">
-        <Metric label="Total cost" value={formatCompactNumber(statistics.totalCost)} />
-        <Metric label="LLM calls" value={String(statistics.llmCalls.length)} />
-        <Metric label="Subagent calls" value={String(statistics.subagentCalls.length)} />
-      </div>
-      <div className="stats-chart-list">
-        <TokenLineChart
-          title="LLM call token cost"
-          subtitle={`${formatCompactNumber(llmCost)} weighted cost`}
-          points={statistics.llmCalls}
-          color="#a879ff"
-          onSelect={selectPoint}
-        />
-        <TokenLineChart
-          title="Subagent call token cost"
-          subtitle={`${formatCompactNumber(subagentCost)} including descendants`}
-          points={statistics.subagentCalls}
-          color="#35d4c7"
-          onSelect={selectPoint}
-        />
-      </div>
+      {statistics?.loading && <div className="stats-loading">Loading token statistics…</div>}
+      {statistics?.error && <div className="stats-error">{statistics.error}</div>}
+      {data && <>
+        <div className="drawer-summary stats-summary">
+          <Metric label="Total cost" value={formatCompactNumber(data.totalCost)} />
+          <Metric label="LLM calls" value={String(data.llmCalls.length)} />
+          <Metric label="Subagent calls" value={String(data.subagentCalls.length)} />
+        </div>
+        <div className="stats-chart-list">
+          <TokenLineChart
+            title="LLM call token cost"
+            subtitle={`${formatCompactNumber(llmCost)} weighted cost`}
+            points={data.llmCalls}
+            color="#a879ff"
+            panelWidth={panelWidth}
+            onSelect={selectPoint}
+          />
+          <TokenLineChart
+            title="Subagent call token cost"
+            subtitle={`${formatCompactNumber(subagentCost)} including descendants`}
+            points={data.subagentCalls}
+            color="#35d4c7"
+            panelWidth={panelWidth}
+            onSelect={selectPoint}
+          />
+        </div>
+      </>}
     </aside>
   )
 }
 
-function TokenLineChart({ title, subtitle, points, color, onSelect }: {
+function TokenLineChart({ title, subtitle, points, color, panelWidth, onSelect }: {
   title: string
   subtitle: string
   points: TokenStatPoint[]
   color: string
+  panelWidth: number
   onSelect: (point: TokenStatPoint) => void
 }) {
-  const [activeIndex, setActiveIndex] = useState<number | null>(null)
-  const width = 330
-  const height = 180
-  const padding = { left: 42, right: 14, top: 20, bottom: 28 }
-  const chartWidth = width - padding.left - padding.right
-  const chartHeight = height - padding.top - padding.bottom
-  const maximum = Math.max(1, ...points.map((point) => point.weightedCost))
-  const coordinates = points.map((point, index) => ({
-    point,
-    x: padding.left + (points.length <= 1 ? chartWidth / 2 : chartWidth * index / (points.length - 1)),
-    y: padding.top + chartHeight * (1 - point.weightedCost / maximum),
-  }))
-  const active = activeIndex === null ? null : coordinates[activeIndex]
+  const previousWidthRef = useRef(panelWidth)
+  const [visibleRange, setVisibleRange] = useState({ start: 0, end: 100 })
+  const minimumRange = Math.min(100, 100 / Math.max(1, points.length))
+  const changeZoom = useCallback((direction: 'in' | 'out') => {
+    setVisibleRange((current) => {
+      const center = (current.start + current.end) / 2
+      const currentSize = current.end - current.start
+      const nextSize = direction === 'in'
+        ? Math.max(minimumRange, currentSize / 1.35)
+        : Math.min(100, currentSize * 1.35)
+      let start = Math.max(0, center - nextSize / 2)
+      let end = Math.min(100, center + nextSize / 2)
+      if (start === 0) end = nextSize
+      if (end === 100) start = 100 - nextSize
+      return { start, end }
+    })
+  }, [minimumRange])
+  const pan = useCallback((direction: 'left' | 'right') => {
+    setVisibleRange((current) => {
+      const size = current.end - current.start
+      const shift = size * 0.22 * (direction === 'left' ? -1 : 1)
+      const start = Math.max(0, Math.min(100 - size, current.start + shift))
+      return { start, end: start + size }
+    })
+  }, [])
+
+  useEffect(() => {
+    const previousWidth = previousWidthRef.current
+    previousWidthRef.current = panelWidth
+    if (panelWidth > previousWidth) {
+      setVisibleRange((current) => {
+        const size = current.end - current.start
+        if (size >= 99.99) return current
+        const center = (current.start + current.end) / 2
+        const nextSize = Math.min(100, size * panelWidth / previousWidth)
+        let start = Math.max(0, center - nextSize / 2)
+        let end = Math.min(100, center + nextSize / 2)
+        if (start === 0) end = nextSize
+        if (end === 100) start = 100 - nextSize
+        return { start, end }
+      })
+    }
+  }, [panelWidth])
+
+  const option = useMemo<EChartsOption>(() => ({
+    animation: false,
+    backgroundColor: 'transparent',
+    title: { show: false, text: title },
+    grid: { left: 50, right: 18, top: 22, bottom: 36, containLabel: false },
+    tooltip: {
+      trigger: 'item',
+      backgroundColor: 'rgba(7,16,29,.97)',
+      borderColor: 'rgba(167,191,222,.25)',
+      textStyle: { color: '#aabbd0', fontSize: 11 },
+      formatter: (raw: unknown) => {
+        const params = raw as { dataIndex: number }
+        const point = points[params.dataIndex]
+        if (!point) return ''
+        return [
+          `<strong>#${point.index} · ${escapeHtml(point.label)}</strong>`,
+          `Weighted cost&nbsp;&nbsp;<b>${point.weightedCost.toLocaleString()}</b>`,
+          `Uncached input&nbsp;&nbsp;<b>${point.uncachedInputTokens.toLocaleString()}</b>`,
+          `Cached&nbsp;&nbsp;<b>${point.cachedTokens.toLocaleString()}</b>`,
+          `Output&nbsp;&nbsp;<b>${point.outputTokens.toLocaleString()}</b>`,
+          ...(point.llmCalls > 1 ? [`LLM calls&nbsp;&nbsp;<b>${point.llmCalls}</b>`] : []),
+        ].join('<br/>')
+      },
+    },
+    xAxis: {
+      type: 'category',
+      data: points.map((point) => String(point.index)),
+      boundaryGap: points.length <= 1,
+      axisLabel: { color: '#5f738d', fontSize: 9 },
+      axisLine: { lineStyle: { color: 'rgba(145,171,205,.18)' } },
+      axisTick: { show: false },
+    },
+    yAxis: {
+      type: 'value',
+      min: 0,
+      axisLabel: { color: '#526780', fontSize: 9, formatter: (value: number) => formatCompactNumber(value) },
+      splitLine: { lineStyle: { color: 'rgba(145,171,205,.12)', type: 'dashed' } },
+    },
+    dataZoom: [{
+      type: 'inside',
+      start: visibleRange.start,
+      end: visibleRange.end,
+      minSpan: minimumRange,
+      zoomOnMouseWheel: true,
+      moveOnMouseWheel: false,
+      moveOnMouseMove: true,
+    }],
+    series: [{
+      type: 'line',
+      data: points.map((point) => point.weightedCost),
+      smooth: false,
+      symbol: 'circle',
+      symbolSize: 8,
+      lineStyle: { color, width: 2 },
+      itemStyle: { color, borderColor: '#eef7ff', borderWidth: 1 },
+      emphasis: { scale: 1.5 },
+    }],
+  }), [color, minimumRange, points, title, visibleRange])
 
   return (
     <section className="token-chart-card">
-      <header><div><strong>{title}</strong><small>{subtitle}</small></div><span>{points.length} points</span></header>
-      {points.length === 0 ? <div className="chart-empty">No calls recorded</div> : <div className="chart-canvas">
-        <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>
-          {[0, 0.5, 1].map((ratio) => {
-            const y = padding.top + chartHeight * ratio
-            const value = maximum * (1 - ratio)
-            return <g key={ratio} className="chart-grid-line">
-              <line x1={padding.left} x2={width - padding.right} y1={y} y2={y} />
-              <text x={padding.left - 6} y={y + 3}>{formatCompactNumber(value)}</text>
-            </g>
-          })}
-          {coordinates.length > 1 && <polyline
-            className="chart-series-line"
-            points={coordinates.map(({ x, y }) => `${x},${y}`).join(' ')}
-            style={{ stroke: color }}
-          />}
-          {coordinates.map(({ point, x, y }, index) => (
-            <g key={point.spanId}>
-              <circle
-                className="chart-hit-point"
-                cx={x}
-                cy={y}
-                r="10"
-                role="button"
-                tabIndex={0}
-                aria-label={`${title} point ${point.index}, cost ${point.weightedCost}`}
-                onMouseEnter={() => setActiveIndex(index)}
-                onMouseLeave={() => setActiveIndex(null)}
-                onFocus={() => setActiveIndex(index)}
-                onBlur={() => setActiveIndex(null)}
-                onClick={() => onSelect(point)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' || event.key === ' ') {
-                    onSelect(point)
-                    event.preventDefault()
-                  }
-                }}
-              />
-              <circle className="chart-visible-point" cx={x} cy={y} r="3.5" style={{ fill: color, stroke: color }} />
-              {(points.length <= 8 || index === 0 || index === points.length - 1) && (
-                <text className="chart-x-label" x={x} y={height - 8}>{point.index}</text>
-              )}
-            </g>
-          ))}
-        </svg>
-        {active && <div
-          className="chart-tooltip"
-          style={{
-            left: `${Math.min(84, Math.max(16, active.x / width * 100))}%`,
-            top: `${Math.max(18, active.y / height * 100)}%`,
-          }}
-        >
-          <strong>#{active.point.index} · {active.point.label}</strong>
-          <span>Weighted cost <b>{active.point.weightedCost.toLocaleString()}</b></span>
-          <span>Uncached input <b>{active.point.uncachedInputTokens.toLocaleString()}</b></span>
-          <span>Cached <b>{active.point.cachedTokens.toLocaleString()}</b></span>
-          <span>Output <b>{active.point.outputTokens.toLocaleString()}</b></span>
-          {active.point.llmCalls > 1 && <span>LLM calls <b>{active.point.llmCalls}</b></span>}
-        </div>}
+      <header>
+        <div><strong>{title}</strong><small>{subtitle}</small></div>
+        <span>{points.length} points</span>
+      </header>
+      {points.length === 0 ? <div className="chart-empty">No calls recorded</div> : <div
+        className="chart-canvas"
+        tabIndex={0}
+        aria-label={`${title}. W and S zoom; A and D move.`}
+        onKeyDown={(event) => {
+          if (event.code === 'KeyW') changeZoom('in')
+          else if (event.code === 'KeyS') changeZoom('out')
+          else if (event.code === 'KeyA') pan('left')
+          else if (event.code === 'KeyD') pan('right')
+          else return
+          event.preventDefault()
+          event.stopPropagation()
+        }}
+      >
+        <div className="chart-key-hint"><kbd>W</kbd><kbd>S</kbd> zoom · <kbd>A</kbd><kbd>D</kbd> move</div>
+        <Suspense fallback={<div className="chart-library-loading">Loading chart…</div>}>
+          <ReactECharts
+            option={option}
+            notMerge
+            opts={{ renderer: 'svg' }}
+            style={{ height: 220, width: '100%' }}
+            onEvents={{
+              click: (params: { dataIndex?: number }) => {
+                if (typeof params.dataIndex === 'number' && points[params.dataIndex]) onSelect(points[params.dataIndex])
+              },
+              datazoom: (params: { start?: number; end?: number; batch?: Array<{ start?: number; end?: number }> }) => {
+                const zoom = params.batch?.[0] ?? params
+                if (typeof zoom.start === 'number' && typeof zoom.end === 'number') {
+                  setVisibleRange({ start: zoom.start, end: zoom.end })
+                }
+              },
+            }}
+          />
+        </Suspense>
       </div>}
     </section>
   )
@@ -1059,7 +1245,7 @@ function Status({ status, compact = false }: { status: string; compact?: boolean
 }
 
 function EmptyState() {
-  return <div className="empty-state"><div className="empty-pulse"><Icon name="activity" /></div><h2>Waiting for agent activity</h2><p>Start a traced Bines task. Host and LLM spans will appear here in real time.</p><code>python -m nTrace.server</code></div>
+  return <div className="empty-state"><div className="empty-pulse"><Icon name="activity" /></div><h2>Select a trace</h2><p>Choose a trace from the history list to load its lightweight timeline.</p><code>Details and token costs load on demand</code></div>
 }
 
 function mergeLiveEvent(detail: TraceDetail, event: TraceEvent): TraceDetail {
@@ -1077,29 +1263,14 @@ function mergeLiveEvent(detail: TraceDetail, event: TraceEvent): TraceDetail {
     ...detail,
     events,
     agents,
-    spans: assembleSpans(events),
+    spans: upsertTimelineSpan(detail.spans, event),
     updated_at: event.timestamp,
     status: detail.status,
   }
 }
 
-function updateTraceSummaries(current: TraceSummary[], event: TraceEvent): TraceSummary[] {
-  const existing = current.find((trace) => trace.trace_id === event.trace_id)
-  const next: TraceSummary = existing ? {
-    ...existing,
-    updated_at: event.timestamp,
-    status: existing.status,
-    agent_count: Math.max(existing.agent_count, event.agent_id),
-    span_count: existing.span_count + (event.type === 'start' ? 1 : 0),
-  } : {
-    trace_id: event.trace_id,
-    started_at: event.timestamp,
-    updated_at: event.timestamp,
-    status: 'running',
-    agent_count: event.agent_id,
-    span_count: 1,
-  }
-  return [next, ...current.filter((trace) => trace.trace_id !== event.trace_id)]
+function updateTraceList(current: TraceListItem[], event: TraceEvent): TraceListItem[] {
+  return [{ trace_id: event.trace_id }, ...current.filter((trace) => trace.trace_id !== event.trace_id)]
 }
 
 function llmLabel(span: TraceSpan): string {
@@ -1126,6 +1297,16 @@ function formatCompactNumber(value: number): string {
     notation: 'compact',
     maximumFractionDigits: 1,
   }).format(value)
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>'"]/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    "'": '&#39;',
+    '"': '&quot;',
+  })[character]!)
 }
 
 function formatValue(value: unknown): string {

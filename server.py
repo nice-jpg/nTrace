@@ -114,7 +114,7 @@ def create_app(
         events = [model.model_dump(mode="json") for model in models]
         stored = storage.put_events(events)
         for event in stored:
-            await stream.broadcast({"kind": "event.created", "event": event})
+            await stream.broadcast({"kind": "event.created", "event": _timeline_event(event)})
         return {"accepted": len(events), "stored": len(stored)}
 
     @app.get("/api/v1/traces")
@@ -166,6 +166,13 @@ def create_app(
             raise HTTPException(status_code=404, detail="Span not found")
         return page
 
+    @app.get("/api/v1/traces/{trace_id}/agents/{agent_id}/token-stats")
+    async def get_agent_token_statistics(trace_id: int, agent_id: int) -> dict[str, Any]:
+        statistics = storage.get_agent_token_statistics(trace_id, agent_id)
+        if statistics is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return statistics
+
     @app.delete("/api/v1/traces/{trace_id}")
     async def delete_trace(trace_id: int) -> dict[str, int]:
         if not storage.delete_trace(trace_id):
@@ -197,6 +204,25 @@ def create_app(
             return FileResponse(assets / "index.html")
 
     return app
+
+
+def _timeline_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Strip heavy payload fields before broadcasting timeline invalidations."""
+
+    fields = (
+        "schema_version",
+        "trace_id",
+        "span_id",
+        "parent_span_id",
+        "agent_id",
+        "parent_agent_id",
+        "agent_name",
+        "activation_order",
+        "sender",
+        "type",
+        "timestamp",
+    )
+    return {field: event.get(field) for field in fields}
 
 
 def main() -> None:

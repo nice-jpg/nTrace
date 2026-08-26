@@ -6,11 +6,28 @@ import type { TraceDetail, TraceEvent, TraceSpan, TraceSummary } from './types'
 
 vi.mock('./api', () => ({
   deleteTrace: vi.fn(),
+  fetchAgentTokenStatistics: vi.fn(),
   fetchSpan: vi.fn(),
   fetchTrace: vi.fn(),
   fetchTraces: vi.fn(),
   fetchUserInputs: vi.fn(),
   openTraceStream: vi.fn(() => () => undefined),
+}))
+
+vi.mock('./TokenChartRenderer', () => ({
+  default: ({ option, onEvents }: {
+    option: { title?: { text?: string }; series?: Array<{ data?: number[] }>; dataZoom?: Array<{ start?: number; end?: number }> }
+    onEvents?: { click?: (params: { dataIndex: number }) => void }
+  }) => <div
+    data-testid={`echart-${option.title?.text ?? 'chart'}`}
+    data-range={`${option.dataZoom?.[0]?.start ?? 0}:${option.dataZoom?.[0]?.end ?? 100}`}
+  >
+    {(option.series?.[0]?.data ?? []).map((_value, index) => <button
+      key={index}
+      aria-label={`${option.title?.text} point ${index + 1}`}
+      onClick={() => onEvents?.click?.({ dataIndex: index })}
+    />)}
+  </div>,
 }))
 
 class ResizeObserverMock {
@@ -171,17 +188,19 @@ describe('trace input details', () => {
 
     const { container } = render(<App />)
     expect(api.fetchSpan).not.toHaveBeenCalled()
+    expect(api.fetchTrace).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByRole('button', { name: '#1' }))
     fireEvent.click(await screen.findByTitle(/HOST/))
 
     await waitFor(() => expect(container.querySelector('.detail-drawer')).toBeInTheDocument())
-    expect(api.fetchSpan).not.toHaveBeenCalled()
+    await waitFor(() => expect(api.fetchSpan).toHaveBeenCalledWith(1, 2))
     expect(api.fetchUserInputs).not.toHaveBeenCalled()
     expect([...container.querySelectorAll('.drawer-grid details')].every(
       (section) => !(section as HTMLDetailsElement).open,
     )).toBe(true)
 
     fireEvent.click(screen.getByText('System prompt'))
-    await waitFor(() => expect(api.fetchSpan).toHaveBeenCalledWith(1, 2))
+    expect(api.fetchSpan).toHaveBeenCalledTimes(1)
     expect(api.fetchUserInputs).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByText(/^User inputs/))
@@ -212,7 +231,7 @@ describe('trace input details', () => {
     expect(container.querySelector('.agent-row')).toHaveClass('collapsed')
     expect(screen.getByRole('button', { name: 'Expand agent main' })).toBeInTheDocument()
 
-    fireEvent.contextMenu(screen.getByRole('button', { name: /#1running/i }))
+    fireEvent.contextMenu(screen.getByRole('button', { name: '#1' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete trace #1' }))
     await waitFor(() => expect(api.deleteTrace).toHaveBeenCalledWith(1))
   })
@@ -235,10 +254,11 @@ describe('trace input details', () => {
     }))
 
     render(<App />)
-    await screen.findByRole('heading', { name: 'Trace 1' })
+    expect(await screen.findByRole('heading', { name: 'Trace timeline' })).toBeInTheDocument()
+    expect(api.fetchTrace).not.toHaveBeenCalled()
 
     const selectTrace = async (traceId: number) => {
-      fireEvent.click(screen.getByRole('button', { name: new RegExp(`#${traceId}completed`, 'i') }))
+      fireEvent.click(screen.getByRole('button', { name: `#${traceId}` }))
       await screen.findByRole('heading', { name: `Trace ${traceId}` })
     }
     await selectTrace(2)
@@ -282,6 +302,7 @@ describe('trace input details', () => {
     })
 
     const { container } = render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: '#1' }))
     await screen.findByRole('heading', { name: 'Trace 1' })
     expect(container.querySelectorAll('.connector-layer path')).toHaveLength(2)
     const before = [...container.querySelectorAll('.connector-layer path')].map((path) => path.getAttribute('d'))
@@ -323,25 +344,65 @@ describe('trace input details', () => {
       events: spans.map((span) => span.start_event!),
       spans,
     })
+    const llmPoints = Array.from({ length: 4 }, (_, index) => ({
+      index: index + 1, spanId: 11, agentId: 1, label: `LLM call ${index + 1}`, llmCalls: 1,
+      inputTokens: 10, uncachedInputTokens: 10, cachedTokens: 0, outputTokens: index + 1,
+      weightedCost: 500 + (index + 1) * 100,
+    }))
+    const subagentPoints = Array.from({ length: 4 }, (_, index) => ({
+      index: index + 1, spanId: 20, agentId: 2, label: `collector-${index + 1}`, llmCalls: index + 1,
+      inputTokens: 20, uncachedInputTokens: 15, cachedTokens: 5, outputTokens: index + 1,
+      weightedCost: 755 + (index + 1) * 100,
+    }))
+    vi.mocked(api.fetchAgentTokenStatistics).mockResolvedValue({
+      agentId: 1,
+      totalCost: [...llmPoints, ...subagentPoints].reduce((sum, point) => sum + point.weightedCost, 0),
+      llmCalls: llmPoints,
+      subagentCalls: subagentPoints,
+    })
+    vi.mocked(api.fetchSpan).mockImplementation(async (_traceId, spanId) => {
+      const span = spans.find((candidate) => candidate.span_id === spanId)
+      if (!span) throw new Error('missing span')
+      return span
+    })
 
     const { container } = render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: '#1' }))
     await screen.findByRole('heading', { name: 'Trace 1' })
     fireEvent.click(screen.getByRole('button', { name: 'Show token statistics for agent root' }))
 
     const panel = screen.getByLabelText('Token statistics for agent root')
     expect(panel).toBeInTheDocument()
-    expect(screen.getByText('LLM call token cost')).toBeInTheDocument()
+    expect(await screen.findByText('LLM call token cost')).toBeInTheDocument()
     expect(screen.getByText('Subagent call token cost')).toBeInTheDocument()
     expect(panel.parentElement).toHaveClass('trace-main-row')
 
-    const llmPoint = screen.getByRole('button', { name: /LLM call token cost point 1/ })
-    fireEvent.mouseEnter(llmPoint)
-    expect(screen.getByText('Weighted cost')).toBeInTheDocument()
+    await waitFor(() => expect(api.fetchAgentTokenStatistics).toHaveBeenCalledWith(1, 1))
+    const llmChart = screen.getByLabelText('LLM call token cost. W and S zoom; A and D move.')
+    const subagentChart = screen.getByLabelText('Subagent call token cost. W and S zoom; A and D move.')
+    fireEvent.keyDown(llmChart, { code: 'KeyW' })
+    fireEvent.keyDown(subagentChart, { code: 'KeyW' })
+    const llmRenderer = screen.getByTestId('echart-LLM call token cost')
+    const subagentRenderer = screen.getByTestId('echart-Subagent call token cost')
+    await waitFor(() => expect(llmRenderer).not.toHaveAttribute('data-range', '0:100'))
+    expect(subagentRenderer).not.toHaveAttribute('data-range', '0:100')
+
+    const rangeSize = (element: HTMLElement) => {
+      const [start, end] = (element.dataset.range ?? '0:100').split(':').map(Number)
+      return end - start
+    }
+    const localRange = rangeSize(llmRenderer)
+    const originalWidth = Number.parseFloat(panel.style.flexBasis)
+    fireEvent.click(screen.getByRole('button', { name: 'Widen token statistics panel' }))
+    await waitFor(() => expect(Number.parseFloat(panel.style.flexBasis)).toBeGreaterThan(originalWidth))
+    await waitFor(() => expect(rangeSize(llmRenderer)).toBeGreaterThan(localRange))
+
+    const llmPoint = await screen.findByRole('button', { name: 'LLM call token cost point 1' })
     fireEvent.click(llmPoint)
     expect(container.querySelector('.detail-drawer')).toBeInTheDocument()
     expect(container.querySelector('[data-span-id="11"]')).toHaveClass('selected')
 
-    const subagentPoint = screen.getByRole('button', { name: /Subagent call token cost point 1/ })
+    const subagentPoint = screen.getByRole('button', { name: 'Subagent call token cost point 1' })
     fireEvent.click(subagentPoint)
     expect(container.querySelector('[data-span-id="20"]')).toHaveClass('selected')
     expect(container.querySelector('.detail-drawer h2')).toHaveTextContent('collector')

@@ -1,4 +1,11 @@
-import type { AgentSummary, TraceEvent, TraceSpan } from './types'
+import type {
+  AgentSummary,
+  AgentTokenStatistics,
+  TokenCostBreakdown,
+  TokenStatPoint,
+  TraceEvent,
+  TraceSpan,
+} from './types'
 
 export const LABEL_WIDTH = 188
 export const AGENT_HEIGHT = 104
@@ -81,6 +88,49 @@ export function upsertEvent(events: TraceEvent[], incoming: TraceEvent): TraceEv
   return copy
 }
 
+export function upsertTimelineSpan(spans: TraceSpan[], event: TraceEvent): TraceSpan[] {
+  const next = spans.map((span) => ({ ...span }))
+  const index = next.findIndex((span) => span.span_id === event.span_id)
+  const existing = index >= 0 ? next[index] : null
+  const { type: _eventType, timestamp: _timestamp, ...identity } = event
+  const startedAt = event.type === 'start'
+    ? event.timestamp
+    : existing?.started_at ?? event.timestamp
+  const endedAt = event.type === 'end'
+    ? event.timestamp
+    : existing?.ended_at ?? null
+  let durationMs: number | null = null
+  if (startedAt && endedAt) {
+    durationMs = Math.max(0, Date.parse(endedAt) - Date.parse(startedAt))
+  }
+  const updated: TraceSpan = {
+    ...(existing ?? identity),
+    ...identity,
+    type: 'span',
+    started_at: startedAt,
+    ended_at: endedAt,
+    duration_ms: durationMs,
+    running: endedAt === null,
+    start_event: event.type === 'start' ? event : existing?.start_event ?? null,
+    end_event: event.type === 'end' ? event : existing?.end_event ?? null,
+  }
+  if (index >= 0) next[index] = updated
+  else next.push(updated)
+  next.sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at) || a.span_id - b.span_id)
+  const previousByLane = new Map<string, TraceSpan>()
+  for (const span of next) {
+    const lane = `${span.agent_id}:${span.sender}`
+    const previous = previousByLane.get(lane)
+    if (previous?.running && span.started_at) {
+      previous.ended_at = span.started_at
+      previous.duration_ms = Math.max(0, Date.parse(span.started_at) - Date.parse(previous.started_at))
+      previous.running = false
+    }
+    previousByLane.set(lane, span)
+  }
+  return next
+}
+
 export function latestEventTime(events: TraceEvent[], fallbackMs: number): number {
   return events.reduce((latest, event) => {
     const timestamp = Date.parse(event.timestamp)
@@ -137,14 +187,6 @@ function numericTokenField(value: unknown): number {
   return Number.isFinite(parsed) ? Math.max(0, parsed) : 0
 }
 
-export interface TokenCostBreakdown {
-  inputTokens: number
-  uncachedInputTokens: number
-  outputTokens: number
-  cachedTokens: number
-  weightedCost: number
-}
-
 export function tokenCostBreakdown(usage: Record<string, unknown> | null | undefined): TokenCostBreakdown {
   const source = usage ?? {}
   const details = typeof source.details === 'object' && source.details !== null
@@ -171,20 +213,6 @@ export function tokenCostBreakdown(usage: Record<string, unknown> | null | undef
 export function tokenCost(span: TraceSpan): number | null {
   if (!span.token_usage || Object.keys(span.token_usage).length === 0) return null
   return tokenCostBreakdown(span.token_usage).weightedCost
-}
-
-export interface TokenStatPoint extends TokenCostBreakdown {
-  index: number
-  spanId: number
-  agentId: number
-  label: string
-  llmCalls: number
-}
-
-export interface AgentTokenStatistics {
-  llmCalls: TokenStatPoint[]
-  subagentCalls: TokenStatPoint[]
-  totalCost: number
 }
 
 export function agentTokenStatistics(
@@ -257,6 +285,7 @@ export function agentTokenStatistics(
   })
 
   return {
+    agentId,
     llmCalls,
     subagentCalls,
     totalCost: llmCalls.reduce((sum, point) => sum + point.weightedCost, 0)

@@ -50,6 +50,33 @@ export interface TraceSummary {
   span_count: number
 }
 
+export interface TraceListItem {
+  trace_id: number
+}
+
+export interface TokenCostBreakdown {
+  inputTokens: number
+  uncachedInputTokens: number
+  outputTokens: number
+  cachedTokens: number
+  weightedCost: number
+}
+
+export interface TokenStatPoint extends TokenCostBreakdown {
+  index: number
+  spanId: number
+  agentId: number
+  label: string
+  llmCalls: number
+}
+
+export interface AgentTokenStatistics {
+  agentId: number
+  llmCalls: TokenStatPoint[]
+  subagentCalls: TokenStatPoint[]
+  totalCost: number
+}
+
 export interface TraceDetail extends TraceSummary {
   agents: AgentSummary[]
   events: TraceEvent[]

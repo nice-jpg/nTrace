@@ -75,10 +75,11 @@ def test_timeline_omits_heavy_payload_and_span_detail_loads_it_on_demand(tmp_pat
 
     timeline = storage.get_trace_timeline(101)
     assert timeline is not None
-    assert "system_prompt" not in timeline["events"][0]
-    assert "user_inputs" not in timeline["events"][0]
-    assert "output" not in timeline["events"][1]
-    assert timeline["spans"][0]["token_usage"] == {"total_tokens": 123}
+    assert "events" not in timeline
+    assert "system_prompt" not in timeline["spans"][0]
+    assert "user_inputs" not in timeline["spans"][0]
+    assert "output" not in timeline["spans"][0]
+    assert "token_usage" not in timeline["spans"][0]
 
     span = storage.get_span(101, 201)
     assert span is not None
@@ -92,6 +93,65 @@ def test_timeline_omits_heavy_payload_and_span_detail_loads_it_on_demand(tmp_pat
     assert "user_inputs" not in details
     assert "start_event" not in details
     assert "end_event" not in details
+    storage.close()
+
+
+def test_trace_list_is_name_only_and_agent_token_stats_load_separately(tmp_path) -> None:
+    storage = TraceStorage(tmp_path / "trace.sqlite3")
+    storage.put_events(
+        [
+            event("start", trace_id=101, span_id=200, timestamp="2026-01-01T00:00:00.000Z"),
+            event(
+                "start", trace_id=101, span_id=201, sender="llm", parent_span_id=200,
+                timestamp="2026-01-01T00:00:00.100Z",
+            ),
+            event(
+                "end", trace_id=101, span_id=201, sender="llm", parent_span_id=200,
+                timestamp="2026-01-01T00:00:00.200Z",
+                token_usage={"input_tokens": 10, "output_tokens": 1},
+            ),
+            event(
+                "start", trace_id=102, span_id=300, agent_name="collector",
+                timestamp="2026-01-01T00:00:01.000Z",
+            ),
+            event(
+                "start", trace_id=102, span_id=301, sender="llm", parent_span_id=300,
+                agent_name="collector", timestamp="2026-01-01T00:00:01.100Z",
+            ),
+            event(
+                "end", trace_id=102, span_id=301, sender="llm", parent_span_id=300,
+                agent_name="collector", timestamp="2026-01-01T00:00:01.200Z",
+                token_usage={
+                    "input_tokens": 20,
+                    "output_tokens": 2,
+                    "input_token_details": {"cached_tokens": 5},
+                },
+            ),
+            event(
+                "start", trace_id=103, span_id=400, agent_name="coder",
+                timestamp="2026-01-01T00:00:02.000Z",
+            ),
+            event(
+                "start", trace_id=103, span_id=401, sender="llm", parent_span_id=400,
+                agent_name="coder", timestamp="2026-01-01T00:00:02.100Z",
+            ),
+            event(
+                "end", trace_id=103, span_id=401, sender="llm", parent_span_id=400,
+                agent_name="coder", timestamp="2026-01-01T00:00:02.200Z",
+                token_usage={"input_tokens": 4, "output_tokens": 1},
+            ),
+        ]
+    )
+
+    assert storage.list_traces() == [{"trace_id": 101}]
+    stats = storage.get_agent_token_statistics(101, 1)
+    assert stats is not None
+    assert [(point["spanId"], point["weightedCost"]) for point in stats["llmCalls"]] == [(201, 600)]
+    assert [
+        (point["spanId"], point["weightedCost"], point["llmCalls"])
+        for point in stats["subagentCalls"]
+    ] == [(300, 1255, 2)]
+    assert stats["totalCost"] == 1855
     storage.close()
 
 

@@ -52,6 +52,10 @@ class TraceStorage:
                 timestamp TEXT NOT NULL,
                 sender TEXT NOT NULL CHECK(sender IN ('host', 'llm')),
                 agent_id INTEGER NOT NULL,
+                parent_span_id INTEGER,
+                parent_span_id_known INTEGER NOT NULL DEFAULT 1,
+                token_usage_json TEXT NOT NULL DEFAULT '{}',
+                token_usage_known INTEGER NOT NULL DEFAULT 1,
                 payload_json TEXT NOT NULL,
                 PRIMARY KEY (trace_id, span_id, event_type),
                 FOREIGN KEY (trace_id) REFERENCES traces(trace_id) ON DELETE CASCADE
@@ -68,6 +72,41 @@ class TraceStorage:
             CREATE INDEX IF NOT EXISTS events_trace_time_idx ON events(trace_id, timestamp);
             CREATE INDEX IF NOT EXISTS agents_trace_order_idx ON agents(trace_id, activation_order);
             CREATE INDEX IF NOT EXISTS trace_contexts_root_idx ON trace_contexts(root_trace_id);
+            CREATE INDEX IF NOT EXISTS traces_updated_idx ON traces(updated_at DESC);
+            """
+        )
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if "parent_span_id" not in columns:
+            self._connection.execute("ALTER TABLE events ADD COLUMN parent_span_id INTEGER")
+        if "parent_span_id_known" not in columns:
+            self._connection.execute(
+                "ALTER TABLE events ADD COLUMN parent_span_id_known INTEGER NOT NULL DEFAULT 0"
+            )
+        if "token_usage_json" not in columns:
+            self._connection.execute(
+                "ALTER TABLE events ADD COLUMN token_usage_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "token_usage_known" not in columns:
+            self._connection.execute(
+                "ALTER TABLE events ADD COLUMN token_usage_known INTEGER NOT NULL DEFAULT 0"
+            )
+        self._connection.execute(
+            """
+            UPDATE events
+            SET parent_span_id=json_extract(payload_json, '$.parent_span_id'),
+                parent_span_id_known=1
+            WHERE parent_span_id_known=0
+            """
+        )
+        self._connection.execute(
+            """
+            UPDATE events
+            SET token_usage_json=COALESCE(json_extract(payload_json, '$.token_usage'), '{}'),
+                token_usage_known=1
+            WHERE token_usage_known=0
             """
         )
         self._connection.commit()
@@ -123,8 +162,10 @@ class TraceStorage:
                 cursor = self._connection.execute(
                     """
                     INSERT INTO events(
-                        trace_id, span_id, event_type, timestamp, sender, agent_id, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        trace_id, span_id, event_type, timestamp, sender, agent_id,
+                        parent_span_id, parent_span_id_known,
+                        token_usage_json, token_usage_known, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?)
                     ON CONFLICT(trace_id, span_id, event_type) DO NOTHING
                     """,
                     (
@@ -134,6 +175,8 @@ class TraceStorage:
                         timestamp,
                         str(event["sender"]),
                         int(event["agent_id"]),
+                        event.get("parent_span_id"),
+                        json.dumps(event.get("token_usage") or {}, ensure_ascii=False, separators=(",", ":")),
                         json.dumps(event, ensure_ascii=False, separators=(",", ":")),
                     ),
                 )
@@ -285,14 +328,9 @@ class TraceStorage:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT t.trace_id, t.started_at, t.updated_at, t.status,
-                       COUNT(DISTINCT a.agent_id) AS agent_count,
-                       COUNT(DISTINCT e.span_id) AS span_count
-                FROM traces t
-                LEFT JOIN agents a ON a.trace_id=t.trace_id
-                LEFT JOIN events e ON e.trace_id=t.trace_id
-                GROUP BY t.trace_id
-                ORDER BY t.updated_at DESC
+                SELECT trace_id
+                FROM traces
+                ORDER BY updated_at DESC
                 LIMIT ?
                 """,
                 (max(1, min(1_000, int(limit))),),
@@ -346,8 +384,7 @@ class TraceStorage:
             event_rows = self._connection.execute(
                 """
                 SELECT trace_id, span_id, event_type, timestamp, sender, agent_id,
-                       json_extract(payload_json, '$.parent_span_id') AS parent_span_id,
-                       json_extract(payload_json, '$.token_usage') AS token_usage_json
+                       parent_span_id
                 FROM events
                 WHERE trace_id=?
                 ORDER BY timestamp, event_type DESC
@@ -360,7 +397,6 @@ class TraceStorage:
         events: list[dict[str, Any]] = []
         for row in event_rows:
             agent = agents_by_id[int(row["agent_id"])]
-            token_usage_json = row["token_usage_json"]
             events.append(
                 {
                     "schema_version": 1,
@@ -374,14 +410,138 @@ class TraceStorage:
                     "sender": row["sender"],
                     "type": row["event_type"],
                     "timestamp": row["timestamp"],
-                    "token_usage": json.loads(token_usage_json) if token_usage_json else {},
                 }
             )
+        spans = assemble_spans(events)
+        timeline_span_fields = (
+            "schema_version", "trace_id", "span_id", "parent_span_id",
+            "agent_id", "parent_agent_id", "agent_name", "activation_order",
+            "sender", "type", "started_at", "ended_at", "duration_ms", "running",
+        )
         return {
             **dict(trace),
+            "agent_count": len(agents),
+            "span_count": len(spans),
             "agents": agents,
-            "events": events,
-            "spans": assemble_spans(events),
+            "spans": [
+                {field: span.get(field) for field in timeline_span_fields}
+                for span in spans
+            ],
+        }
+
+    def get_agent_token_statistics(
+        self,
+        trace_id: int,
+        agent_id: int,
+    ) -> dict[str, Any] | None:
+        """Load token-only data for one agent and its direct child call trees."""
+
+        with self._lock:
+            selected = self._connection.execute(
+                "SELECT agent_id FROM agents WHERE trace_id=? AND agent_id=?",
+                (trace_id, agent_id),
+            ).fetchone()
+            if selected is None:
+                return None
+            agent_rows = self._connection.execute(
+                """
+                SELECT agent_id, parent_agent_id, agent_name, activation_order
+                FROM agents WHERE trace_id=? ORDER BY activation_order, agent_id
+                """,
+                (trace_id,),
+            ).fetchall()
+
+        agents = [dict(row) for row in agent_rows]
+        children_by_parent: dict[int, list[int]] = {}
+        for agent in agents:
+            parent = agent["parent_agent_id"]
+            if parent is not None:
+                children_by_parent.setdefault(int(parent), []).append(int(agent["agent_id"]))
+        relevant_agent_ids = sorted(_descendant_agent_ids(agent_id, children_by_parent))
+        placeholders = ",".join("?" for _ in relevant_agent_ids)
+
+        with self._lock:
+            llm_rows = self._connection.execute(
+                f"""
+                SELECT span_id, agent_id,
+                       MIN(timestamp) AS started_at,
+                       MAX(CASE WHEN event_type='start' THEN token_usage_json END) AS start_usage,
+                       MAX(CASE WHEN event_type='end' THEN token_usage_json END) AS end_usage
+                FROM events
+                WHERE trace_id=? AND sender='llm' AND agent_id IN ({placeholders})
+                GROUP BY span_id, agent_id
+                ORDER BY started_at, span_id
+                """,
+                (trace_id, *relevant_agent_ids),
+            ).fetchall()
+            host_rows = self._connection.execute(
+                f"""
+                SELECT agent_id, span_id, timestamp
+                FROM events
+                WHERE trace_id=? AND sender='host' AND event_type='start'
+                  AND agent_id IN ({placeholders})
+                ORDER BY timestamp, span_id
+                """,
+                (trace_id, *relevant_agent_ids),
+            ).fetchall()
+
+        calls: list[dict[str, Any]] = []
+        for row in llm_rows:
+            end_usage = json.loads(row["end_usage"] or "{}")
+            start_usage = json.loads(row["start_usage"] or "{}")
+            calls.append(
+                {
+                    "spanId": int(row["span_id"]),
+                    "agentId": int(row["agent_id"]),
+                    "startedAt": str(row["started_at"]),
+                    **_token_cost_breakdown(end_usage or start_usage),
+                }
+            )
+
+        own_calls = [call for call in calls if call["agentId"] == agent_id]
+        llm_points = [
+            {
+                **call,
+                "index": index,
+                "label": f"LLM call {index}",
+                "llmCalls": 1,
+            }
+            for index, call in enumerate(own_calls, 1)
+        ]
+        first_host_by_agent: dict[int, int] = {}
+        for row in host_rows:
+            first_host_by_agent.setdefault(int(row["agent_id"]), int(row["span_id"]))
+
+        direct_children = sorted(
+            (agent for agent in agents if agent["parent_agent_id"] == agent_id),
+            key=lambda agent: (int(agent["activation_order"]), int(agent["agent_id"])),
+        )
+        subagent_points: list[dict[str, Any]] = []
+        for index, child in enumerate(direct_children, 1):
+            child_id = int(child["agent_id"])
+            target_span = first_host_by_agent.get(child_id)
+            if target_span is None:
+                continue
+            descendants = _descendant_agent_ids(child_id, children_by_parent)
+            branch_calls = [call for call in calls if call["agentId"] in descendants]
+            total = _sum_token_costs(branch_calls)
+            subagent_points.append(
+                {
+                    **total,
+                    "index": index,
+                    "spanId": target_span,
+                    "agentId": child_id,
+                    "label": str(child["agent_name"]),
+                    "llmCalls": len(branch_calls),
+                }
+            )
+
+        return {
+            "agentId": agent_id,
+            "llmCalls": llm_points,
+            "subagentCalls": subagent_points,
+            "totalCost": sum(point["weightedCost"] for point in llm_points)
+            + sum(point["weightedCost"] for point in subagent_points),
         }
 
     def get_span(self, trace_id: int, span_id: int) -> dict[str, Any] | None:
@@ -510,6 +670,56 @@ def assemble_spans(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _token_number(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _token_cost_breakdown(usage: dict[str, Any]) -> dict[str, int]:
+    details = usage.get("details") if isinstance(usage.get("details"), dict) else {}
+    input_details = details.get("input_token_details")
+    if not isinstance(input_details, dict):
+        input_details = usage.get("input_token_details")
+    if not isinstance(input_details, dict):
+        input_details = {}
+    input_tokens = _token_number(usage.get("input_tokens", details.get("input_tokens")))
+    output_tokens = _token_number(usage.get("output_tokens", details.get("output_tokens")))
+    cached_tokens = min(input_tokens, _token_number(input_details.get("cached_tokens")))
+    uncached_tokens = input_tokens - cached_tokens
+    return {
+        "inputTokens": input_tokens,
+        "uncachedInputTokens": uncached_tokens,
+        "outputTokens": output_tokens,
+        "cachedTokens": cached_tokens,
+        "weightedCost": output_tokens * 100 + cached_tokens + uncached_tokens * 50,
+    }
+
+
+def _descendant_agent_ids(root_agent_id: int, children_by_parent: dict[int, list[int]]) -> set[int]:
+    result: set[int] = set()
+    pending = [root_agent_id]
+    while pending:
+        current = pending.pop()
+        if current in result:
+            continue
+        result.add(current)
+        pending.extend(children_by_parent.get(current, []))
+    return result
+
+
+def _sum_token_costs(calls: list[dict[str, Any]]) -> dict[str, int]:
+    fields = (
+        "inputTokens",
+        "uncachedInputTokens",
+        "outputTokens",
+        "cachedTokens",
+        "weightedCost",
+    )
+    return {field: sum(int(call[field]) for call in calls) for field in fields}
 
 
 __all__ = ["TraceStorage", "assemble_spans"]
