@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  agentTokenStatistics,
   assembleSpans,
   centeredZoomScrollLeft,
   childConnectorSpans,
@@ -13,7 +14,7 @@ import {
   tokenCostBreakdown,
   upsertEvent,
 } from './traceMath'
-import type { TraceEvent } from './types'
+import type { AgentSummary, TraceEvent } from './types'
 
 function event(type: 'start' | 'end', overrides: Partial<TraceEvent> = {}): TraceEvent {
   return {
@@ -132,6 +133,37 @@ describe('trace timeline math', () => {
       cachedTokens: 1000,
       weightedCost: 101350,
     })
+  })
+
+  it('builds per-LLM and recursive direct-subagent token series', () => {
+    const agents: AgentSummary[] = [
+      { agent_id: 1, parent_agent_id: null, agent_name: 'main', activation_order: 1, first_seen_at: '2026-01-01T00:00:00.000Z' },
+      { agent_id: 2, parent_agent_id: 1, agent_name: 'collector-a', activation_order: 2, first_seen_at: '2026-01-01T00:00:02.000Z' },
+      { agent_id: 3, parent_agent_id: 2, agent_name: 'coder', activation_order: 3, first_seen_at: '2026-01-01T00:00:04.000Z' },
+      { agent_id: 4, parent_agent_id: 1, agent_name: 'collector-b', activation_order: 4, first_seen_at: '2026-01-01T00:00:06.000Z' },
+    ]
+    const llm = (spanId: number, agentId: number, parentAgentId: number | null, second: number, tokenUsage: Record<string, unknown>) => [
+      event('start', { span_id: spanId, agent_id: agentId, parent_agent_id: parentAgentId, sender: 'llm', timestamp: `2026-01-01T00:00:0${second}.000Z` }),
+      event('end', { span_id: spanId, agent_id: agentId, parent_agent_id: parentAgentId, sender: 'llm', timestamp: `2026-01-01T00:00:0${second}.500Z`, token_usage: tokenUsage }),
+    ]
+    const spans = assembleSpans([
+      ...llm(10, 1, null, 1, { input_tokens: 10, output_tokens: 1 }),
+      event('start', { span_id: 20, agent_id: 2, parent_agent_id: 1, parent_span_id: 10, sender: 'host', timestamp: '2026-01-01T00:00:02.000Z' }),
+      ...llm(21, 2, 1, 3, { input_tokens: 20, output_tokens: 2, input_token_details: { cached_tokens: 5 } }),
+      event('start', { span_id: 30, agent_id: 3, parent_agent_id: 2, parent_span_id: 21, sender: 'host', timestamp: '2026-01-01T00:00:04.000Z' }),
+      ...llm(31, 3, 2, 5, { input_tokens: 4, output_tokens: 1 }),
+      event('start', { span_id: 40, agent_id: 4, parent_agent_id: 1, parent_span_id: 10, sender: 'host', timestamp: '2026-01-01T00:00:06.000Z' }),
+      ...llm(41, 4, 1, 7, { input_tokens: 2, output_tokens: 0 }),
+    ])
+
+    const statistics = agentTokenStatistics(1, agents, spans)
+
+    expect(statistics.llmCalls.map((point) => [point.spanId, point.weightedCost])).toEqual([[10, 600]])
+    expect(statistics.subagentCalls.map((point) => [point.spanId, point.weightedCost, point.llmCalls])).toEqual([
+      [20, 1255, 2],
+      [40, 100, 1],
+    ])
+    expect(statistics.totalCost).toBe(1955)
   })
 
   it('draws the first connector for every derived agent, including nested agents', () => {

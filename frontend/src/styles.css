@@ -66,7 +66,9 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 @keyframes status-pulse { 50% { opacity: .45; } }
 .error-banner { margin: 12px 18px 0; padding: 10px 13px; background: rgba(197,79,97,.12); border: 1px solid rgba(197,79,97,.25); color: #ee9aa7; border-radius: 8px; font-size: 12px; }
 
+.trace-main-row { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; overflow: hidden; }
 .timeline-card { flex: 1 1 auto; width: auto; min-width: 0; max-width: calc(100% - 36px); min-height: 0; margin: 16px 18px 18px; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: rgba(8,18,31,.77); box-shadow: 0 18px 50px rgba(0,0,0,.18); }
+.trace-main-row .timeline-card { max-width: none; }
 .timeline-toolbar { height: 49px; display: flex; align-items: center; justify-content: space-between; padding: 0 13px 0 18px; border-bottom: 1px solid var(--line); }
 .legend { display: flex; gap: 20px; color: #8294ac; font-size: 10px; }
 .legend span { display: flex; align-items: center; gap: 7px; }
@@ -90,7 +92,9 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .agent-label { position: sticky; left: 0; z-index: 12; width: 188px; height: 100%; padding: 20px 13px; display: flex; align-items: flex-start; gap: 10px; background: #0b1625; border-right: 1px solid var(--line); }
 .agent-row.collapsed .agent-label { padding-top: 9px; padding-bottom: 8px; align-items: center; }
 .agent-index { display: grid; place-items: center; width: 26px; height: 22px; border-radius: 5px; background: #142236; color: #8194ae; font: 500 9px DM Mono, monospace; }
-.agent-label > div { min-width: 0; flex: 1; }
+.agent-name-button { min-width: 0; flex: 1; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.agent-name-button:hover strong, .agent-name-button:focus-visible strong { color: #f1f7ff; text-decoration: underline; text-decoration-color: rgba(53,212,199,.55); text-underline-offset: 3px; }
+.agent-name-button:focus-visible { outline: none; }
 .agent-label strong { display: block; max-width: 92px; overflow: hidden; text-overflow: ellipsis; color: #cbd8e9; font-size: 11px; white-space: nowrap; }
 .agent-label small { display: block; margin-top: 5px; color: #62758f; font-size: 9px; }
 .agent-row.collapsed .agent-label small { margin-top: 2px; }
@@ -98,6 +102,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .agent-collapse-button:hover, .agent-collapse-button:focus-visible { color: #b4c6db; background: rgba(126,151,183,.1); outline: none; }
 .agent-collapse-button svg { width: 14px; height: 14px; transform: rotate(90deg); transition: transform .15s ease; }
 .agent-row.collapsed .agent-collapse-button svg { transform: rotate(0); }
+.agent-row.stats-selected .agent-label { background: linear-gradient(90deg, rgba(53,212,199,.1), #0b1625 72%); box-shadow: inset 2px 0 var(--cyan); }
 .lane { position: absolute; z-index: 1; height: 52px; border-bottom: 1px solid rgba(150,176,211,.055); overflow: visible; }
 .lane-host { top: 0; }
 .lane-llm { top: 52px; }
@@ -113,6 +118,37 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .clip-mark { position: absolute; right: 0; top: 0; height: 100%; min-width: 22px; padding: 7px 4px 0; background: rgba(5,13,23,.86); color: #d6e4f6; font: 500 11px DM Mono, monospace; }
 .connector-layer { position: absolute; z-index: 7; pointer-events: none; overflow: visible; }
 .connector-layer path { fill: none; stroke: rgba(87,218,205,.72); stroke-width: 1.4; stroke-dasharray: 3 3; filter: drop-shadow(0 0 3px rgba(53,212,199,.3)); }
+
+.agent-stats-panel { flex: 0 0 clamp(300px, 28vw, 380px); min-width: 280px; min-height: 0; margin: 16px 18px 18px 0; border: 1px solid rgba(145,171,205,.2); border-radius: 12px; overflow-y: auto; overscroll-behavior: contain; background: rgba(8,17,29,.98); box-shadow: 0 18px 50px rgba(0,0,0,.28); scrollbar-color: #2b3e58 #091321; scrollbar-width: thin; animation: stats-in .18s ease-out; }
+@keyframes stats-in { from { transform: translateX(18px); opacity: .45; } }
+.stats-header { padding-top: 15px; padding-bottom: 13px; border-bottom: 1px solid var(--line); }
+.stats-header h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stats-header h2 small { display: block; margin: 4px 0 0; }
+.stats-summary { margin-top: 12px; margin-inline: 14px; }
+.stats-summary .metric { min-width: 0; padding-inline: 8px; }
+.stats-summary .metric span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stats-chart-list { display: grid; gap: 10px; padding: 0 14px 14px; }
+.token-chart-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: #091523; }
+.token-chart-card > header { min-height: 48px; padding: 10px 11px; display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--line); }
+.token-chart-card > header div { min-width: 0; }
+.token-chart-card > header strong { display: block; color: #c5d3e5; font-size: 11px; }
+.token-chart-card > header small { display: block; margin-top: 4px; overflow: hidden; color: #61758f; font: 400 8.5px DM Mono, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.token-chart-card > header > span { flex: 0 0 auto; padding: 3px 6px; border-radius: 9px; color: #7f94ae; background: #15243a; font: 500 8px DM Mono, monospace; }
+.chart-canvas { position: relative; min-height: 180px; background: linear-gradient(180deg, rgba(25,42,64,.2), transparent); }
+.chart-canvas svg { display: block; width: 100%; height: auto; }
+.chart-grid-line line { stroke: rgba(145,171,205,.12); stroke-width: 1; stroke-dasharray: 2 4; }
+.chart-grid-line text { fill: #526780; stroke: none; font: 7px DM Mono, monospace; text-anchor: end; }
+.chart-series-line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 0 4px rgba(146,104,244,.28)); }
+.chart-visible-point { stroke-width: 2; pointer-events: none; }
+.chart-hit-point { fill: transparent; stroke: transparent; cursor: pointer; }
+.chart-hit-point:hover + .chart-visible-point, .chart-hit-point:focus + .chart-visible-point { r: 5px; stroke: #eef7ff !important; }
+.chart-hit-point:focus { outline: none; }
+.chart-x-label { fill: #5f738d; stroke: none; font: 7px DM Mono, monospace; text-anchor: middle; }
+.chart-tooltip { position: absolute; z-index: 5; min-width: 154px; padding: 9px 10px; border: 1px solid rgba(167,191,222,.25); border-radius: 7px; color: #aabbd0; background: rgba(7,16,29,.97); box-shadow: 0 10px 28px rgba(0,0,0,.42); transform: translate(-50%, calc(-100% - 9px)); pointer-events: none; font-size: 9px; }
+.chart-tooltip strong { display: block; margin-bottom: 6px; color: #dbe7f6; font-size: 10px; }
+.chart-tooltip span { display: flex; justify-content: space-between; gap: 12px; margin-top: 3px; }
+.chart-tooltip b { color: #e3d9ff; font: 600 9px DM Mono, monospace; }
+.chart-empty { height: 180px; display: grid; place-items: center; color: #5e728c; font-size: 10px; }
 
 .empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--muted); }
 .empty-pulse { width: 62px; height: 62px; display: grid; place-items: center; border-radius: 50%; color: var(--cyan); border: 1px solid rgba(53,212,199,.22); background: rgba(53,212,199,.06); box-shadow: 0 0 60px rgba(53,212,199,.08); }
@@ -130,8 +166,8 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .drawer-header { padding: 10px 22px 10px; display: flex; justify-content: space-between; align-items: center; }
 .drawer-header > * { min-width: 0; }
 .drawer-header > div:first-child { display: flex; align-items: center; gap: 10px; }
-.detail-drawer h2 { margin: 0; font-size: 15px; }
-.detail-drawer h2 small { margin-left: 6px; color: var(--muted); font: 400 10px DM Mono, monospace; }
+.detail-drawer h2, .agent-stats-panel h2 { margin: 0; font-size: 15px; }
+.detail-drawer h2 small, .agent-stats-panel h2 small { margin-left: 6px; color: var(--muted); font: 400 10px DM Mono, monospace; }
 .sender-chip { padding: 4px 7px; border-radius: 5px; text-transform: uppercase; font: 500 8px DM Mono, monospace; letter-spacing: .08em; }
 .sender-chip.host { color: #6ce1d7; background: rgba(53,212,199,.12); }
 .sender-chip.llm { color: #b9a1ff; background: rgba(146,104,244,.14); }

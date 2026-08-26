@@ -1,4 +1,4 @@
-import type { TraceEvent, TraceSpan } from './types'
+import type { AgentSummary, TraceEvent, TraceSpan } from './types'
 
 export const LABEL_WIDTH = 188
 export const AGENT_HEIGHT = 104
@@ -171,6 +171,97 @@ export function tokenCostBreakdown(usage: Record<string, unknown> | null | undef
 export function tokenCost(span: TraceSpan): number | null {
   if (!span.token_usage || Object.keys(span.token_usage).length === 0) return null
   return tokenCostBreakdown(span.token_usage).weightedCost
+}
+
+export interface TokenStatPoint extends TokenCostBreakdown {
+  index: number
+  spanId: number
+  agentId: number
+  label: string
+  llmCalls: number
+}
+
+export interface AgentTokenStatistics {
+  llmCalls: TokenStatPoint[]
+  subagentCalls: TokenStatPoint[]
+  totalCost: number
+}
+
+export function agentTokenStatistics(
+  agentId: number,
+  agents: AgentSummary[],
+  spans: TraceSpan[],
+): AgentTokenStatistics {
+  const orderedSpans = [...spans].sort(
+    (a, b) => Date.parse(a.started_at) - Date.parse(b.started_at) || a.span_id - b.span_id,
+  )
+  const llmCalls = orderedSpans
+    .filter((span) => span.agent_id === agentId && span.sender === 'llm')
+    .map((span, index) => ({
+      ...tokenCostBreakdown(span.token_usage),
+      index: index + 1,
+      spanId: span.span_id,
+      agentId: span.agent_id,
+      label: `LLM call ${index + 1}`,
+      llmCalls: 1,
+    }))
+
+  const childrenByParent = new Map<number, number[]>()
+  for (const agent of agents) {
+    if (agent.parent_agent_id === null) continue
+    const children = childrenByParent.get(agent.parent_agent_id) ?? []
+    children.push(agent.agent_id)
+    childrenByParent.set(agent.parent_agent_id, children)
+  }
+  const subtreeAgentIds = (rootAgentId: number): Set<number> => {
+    const result = new Set<number>()
+    const pending = [rootAgentId]
+    while (pending.length) {
+      const current = pending.pop()!
+      if (result.has(current)) continue
+      result.add(current)
+      pending.push(...(childrenByParent.get(current) ?? []))
+    }
+    return result
+  }
+  const directChildren = agents
+    .filter((agent) => agent.parent_agent_id === agentId)
+    .sort((a, b) => a.activation_order - b.activation_order || a.agent_id - b.agent_id)
+  const subagentCalls = directChildren.flatMap((agent, childIndex) => {
+    const targetSpan = orderedSpans.find(
+      (span) => span.agent_id === agent.agent_id && span.sender === 'host',
+    ) ?? orderedSpans.find((span) => span.agent_id === agent.agent_id)
+    if (!targetSpan) return []
+    const descendants = subtreeAgentIds(agent.agent_id)
+    const childLlmSpans = orderedSpans.filter(
+      (span) => descendants.has(span.agent_id) && span.sender === 'llm',
+    )
+    const total = childLlmSpans.reduce<TokenCostBreakdown>((sum, span) => {
+      const cost = tokenCostBreakdown(span.token_usage)
+      return {
+        inputTokens: sum.inputTokens + cost.inputTokens,
+        uncachedInputTokens: sum.uncachedInputTokens + cost.uncachedInputTokens,
+        outputTokens: sum.outputTokens + cost.outputTokens,
+        cachedTokens: sum.cachedTokens + cost.cachedTokens,
+        weightedCost: sum.weightedCost + cost.weightedCost,
+      }
+    }, { inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cachedTokens: 0, weightedCost: 0 })
+    return [{
+      ...total,
+      index: childIndex + 1,
+      spanId: targetSpan.span_id,
+      agentId: agent.agent_id,
+      label: agent.agent_name,
+      llmCalls: childLlmSpans.length,
+    }]
+  })
+
+  return {
+    llmCalls,
+    subagentCalls,
+    totalCost: llmCalls.reduce((sum, point) => sum + point.weightedCost, 0)
+      + subagentCalls.reduce((sum, point) => sum + point.weightedCost, 0),
+  }
 }
 
 export function decodeEscapedText(value: string): string {

@@ -4,6 +4,7 @@ import { deleteTrace as deleteTraceRequest, fetchSpan, fetchTrace, fetchTraces, 
 import {
   LABEL_WIDTH,
   RULER_HEIGHT,
+  agentTokenStatistics,
   assembleSpans,
   centeredZoomScrollLeft,
   childConnectorSpans,
@@ -20,7 +21,7 @@ import {
   upsertEvent,
 } from './traceMath'
 import type { AgentSummary, TraceDetail, TraceEvent, TraceSpan, TraceSummary } from './types'
-import type { AgentRowLayout } from './traceMath'
+import type { AgentRowLayout, TokenStatPoint } from './traceMath'
 import { getCachedTrace, putCachedTrace } from './traceCache'
 
 const Icon = ({ name }: { name: 'trace' | 'activity' | 'chevron' | 'copy' | 'close' }) => {
@@ -46,6 +47,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [detail, setDetail] = useState<TraceDetail | null>(null)
   const [selectedSpan, setSelectedSpan] = useState<SpanSelection | null>(null)
+  const [selectedAgentId, setSelectedAgentId] = useState<number | null>(null)
   const [historyOpen, setHistoryOpen] = useState(true)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState('')
@@ -205,7 +207,7 @@ export default function App() {
         traces={traces}
         selectedId={selectedId}
         onToggle={() => setHistoryOpen((value) => !value)}
-        onSelect={(id) => { setSelectedId(id); clearSelectedSpan() }}
+        onSelect={(id) => { setSelectedId(id); setSelectedAgentId(null); clearSelectedSpan() }}
         onDelete={(id) => void deleteTrace(id)}
       />
 
@@ -226,13 +228,23 @@ export default function App() {
 
         {error && <div className="error-banner">{error}</div>}
         {!detail && !error && <EmptyState />}
-        {detail && (
+        {detail && <div className={`trace-main-row ${selectedAgentId !== null ? 'stats-open' : ''}`}>
           <Timeline
             trace={detail}
+            selectedAgentId={selectedAgentId}
             selectedSpanId={selectedSpan?.timeline.span_id ?? null}
+            onSelectAgent={setSelectedAgentId}
             onSelectSpan={selectSpan}
           />
-        )}
+          {selectedAgentId !== null && detail.agents.some((agent) => agent.agent_id === selectedAgentId) && (
+            <AgentStatsPanel
+              agent={detail.agents.find((agent) => agent.agent_id === selectedAgentId)!}
+              trace={detail}
+              onSelectSpan={selectSpan}
+              onClose={() => setSelectedAgentId(null)}
+            />
+          )}
+        </div>}
         {selectedSpan && (
           <DetailDrawer
             key={`${selectedSpan.timeline.trace_id}:${selectedSpan.timeline.span_id}`}
@@ -331,9 +343,11 @@ function HistoryPanel({
   )
 }
 
-function Timeline({ trace, selectedSpanId, onSelectSpan }: {
+function Timeline({ trace, selectedAgentId, selectedSpanId, onSelectAgent, onSelectSpan }: {
   trace: TraceDetail
+  selectedAgentId: number | null
   selectedSpanId: number | null
+  onSelectAgent: (agentId: number) => void
   onSelectSpan: (span: TraceSpan) => void
 }) {
   const viewportRef = useRef<HTMLDivElement>(null)
@@ -427,6 +441,33 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
     if (follow && viewportRef.current) viewportRef.current.scrollLeft = viewportRef.current.scrollWidth
   }, [follow, spans.length, latestMs])
 
+  useEffect(() => {
+    if (selectedSpanId === null) return
+    const selected = spans.find((span) => span.span_id === selectedSpanId)
+    if (selected && collapsedAgentIds.has(selected.agent_id)) {
+      setCollapsedAgentIds((current) => {
+        const next = new Set(current)
+        next.delete(selected.agent_id)
+        return next
+      })
+      return
+    }
+    window.requestAnimationFrame(() => {
+      const viewport = viewportRef.current
+      const block = viewport?.querySelector<HTMLElement>(`[data-span-id="${selectedSpanId}"]`)
+      if (!viewport || !block) return
+      const viewportRect = viewport.getBoundingClientRect()
+      const blockRect = block.getBoundingClientRect()
+      const left = Math.max(0, viewport.scrollLeft + blockRect.left - viewportRect.left - viewport.clientWidth / 2 + blockRect.width / 2)
+      const top = Math.max(0, viewport.scrollTop + blockRect.top - viewportRect.top - viewport.clientHeight / 2 + blockRect.height / 2)
+      if (typeof viewport.scrollTo === 'function') viewport.scrollTo({ left, top, behavior: 'smooth' })
+      else {
+        viewport.scrollLeft = left
+        viewport.scrollTop = top
+      }
+    })
+  }, [collapsedAgentIds, selectedSpanId, spans])
+
   const tickSegments = Math.max(8, Math.min(64, Math.floor((canvasWidth - 80) / 108)))
   const ticks = Array.from({ length: tickSegments + 1 }, (_, index) => ({
     left: (canvasWidth - 80) * index / tickSegments,
@@ -469,6 +510,7 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
               key={agent.agent_id}
               agent={agent}
               layout={rowLayouts[agentIndex]}
+              statsSelected={selectedAgentId === agent.agent_id}
               spans={spans.filter((span) => span.agent_id === agent.agent_id)}
               startMs={startMs}
               timelineEndMs={latestMs}
@@ -478,6 +520,7 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
               eventOrder={eventOrder}
               childParentIds={childParentIds}
               selectedSpanId={selectedSpanId}
+              onSelectAgent={() => onSelectAgent(agent.agent_id)}
               onSelectSpan={onSelectSpan}
               onToggleCollapsed={() => setCollapsedAgentIds((current) => {
                 const next = new Set(current)
@@ -493,9 +536,10 @@ function Timeline({ trace, selectedSpanId, onSelectSpan }: {
   )
 }
 
-function AgentRows({ agent, layout, spans, startMs, timelineEndMs, pixelsPerMs, canvasWidth, viewportWidth, eventOrder, childParentIds, selectedSpanId, onSelectSpan, onToggleCollapsed }: {
+function AgentRows({ agent, layout, statsSelected, spans, startMs, timelineEndMs, pixelsPerMs, canvasWidth, viewportWidth, eventOrder, childParentIds, selectedSpanId, onSelectAgent, onSelectSpan, onToggleCollapsed }: {
   agent: AgentSummary
   layout: AgentRowLayout
+  statsSelected: boolean
   spans: TraceSpan[]
   startMs: number
   timelineEndMs: number
@@ -505,14 +549,17 @@ function AgentRows({ agent, layout, spans, startMs, timelineEndMs, pixelsPerMs, 
   eventOrder: Map<number, number>
   childParentIds: Set<number>
   selectedSpanId: number | null
+  onSelectAgent: () => void
   onSelectSpan: (span: TraceSpan) => void
   onToggleCollapsed: () => void
 }) {
   return (
-    <div className={`agent-row ${layout.collapsed ? 'collapsed' : ''}`} style={{ top: RULER_HEIGHT + layout.top, height: layout.height }}>
+    <div className={`agent-row ${layout.collapsed ? 'collapsed' : ''} ${statsSelected ? 'stats-selected' : ''}`} style={{ top: RULER_HEIGHT + layout.top, height: layout.height }}>
       <div className="agent-label">
         <span className="agent-index">{String(agent.activation_order).padStart(2, '0')}</span>
-        <div><strong>{agent.agent_name}</strong><small>{agent.parent_agent_id ? `child of ${agent.parent_agent_id}` : 'main agent'}</small></div>
+        <button className="agent-name-button" onClick={onSelectAgent} aria-label={`Show token statistics for agent ${agent.agent_name}`}>
+          <strong>{agent.agent_name}</strong><small>{agent.parent_agent_id ? `child of ${agent.parent_agent_id}` : 'main agent'}</small>
+        </button>
         <button
           className="agent-collapse-button"
           onClick={onToggleCollapsed}
@@ -531,6 +578,7 @@ function AgentRows({ agent, layout, spans, startMs, timelineEndMs, pixelsPerMs, 
             return (
               <button
                 key={span.span_id}
+                data-span-id={span.span_id}
                 className={`trace-block ${sender} ${span.running ? 'running' : ''} ${selectedSpanId === span.span_id ? 'selected' : ''}`}
                 style={{
                   left: layout.left,
@@ -576,6 +624,150 @@ function ConnectorLayer({ rowLayouts, spans, connectors, startMs, pixelsPerMs, w
         return <path key={span.span_id} d={`M ${x} ${fromY} h 14 V ${toY} h 9`} />
       })}
     </svg>
+  )
+}
+
+function AgentStatsPanel({ agent, trace, onSelectSpan, onClose }: {
+  agent: AgentSummary
+  trace: TraceDetail
+  onSelectSpan: (span: TraceSpan) => void
+  onClose: () => void
+}) {
+  const statistics = useMemo(
+    () => agentTokenStatistics(agent.agent_id, trace.agents, trace.spans),
+    [agent.agent_id, trace.agents, trace.spans],
+  )
+  const spanById = useMemo(
+    () => new Map(trace.spans.map((span) => [span.span_id, span])),
+    [trace.spans],
+  )
+  const selectPoint = (point: TokenStatPoint) => {
+    const span = spanById.get(point.spanId)
+    if (span) onSelectSpan(span)
+  }
+  const llmCost = statistics.llmCalls.reduce((sum, point) => sum + point.weightedCost, 0)
+  const subagentCost = statistics.subagentCalls.reduce((sum, point) => sum + point.weightedCost, 0)
+
+  return (
+    <aside className="agent-stats-panel" aria-label={`Token statistics for agent ${agent.agent_name}`}>
+      <header className="drawer-header stats-header">
+        <div>
+          <span className="sender-chip host">Agent</span>
+          <h2>{agent.agent_name}<small>token statistics</small></h2>
+        </div>
+        <div className="drawer-actions">
+          <button className="icon-button" onClick={onClose} aria-label="Close agent statistics"><Icon name="close" /></button>
+        </div>
+      </header>
+      <div className="drawer-summary stats-summary">
+        <Metric label="Total cost" value={formatCompactNumber(statistics.totalCost)} />
+        <Metric label="LLM calls" value={String(statistics.llmCalls.length)} />
+        <Metric label="Subagent calls" value={String(statistics.subagentCalls.length)} />
+      </div>
+      <div className="stats-chart-list">
+        <TokenLineChart
+          title="LLM call token cost"
+          subtitle={`${formatCompactNumber(llmCost)} weighted cost`}
+          points={statistics.llmCalls}
+          color="#a879ff"
+          onSelect={selectPoint}
+        />
+        <TokenLineChart
+          title="Subagent call token cost"
+          subtitle={`${formatCompactNumber(subagentCost)} including descendants`}
+          points={statistics.subagentCalls}
+          color="#35d4c7"
+          onSelect={selectPoint}
+        />
+      </div>
+    </aside>
+  )
+}
+
+function TokenLineChart({ title, subtitle, points, color, onSelect }: {
+  title: string
+  subtitle: string
+  points: TokenStatPoint[]
+  color: string
+  onSelect: (point: TokenStatPoint) => void
+}) {
+  const [activeIndex, setActiveIndex] = useState<number | null>(null)
+  const width = 330
+  const height = 180
+  const padding = { left: 42, right: 14, top: 20, bottom: 28 }
+  const chartWidth = width - padding.left - padding.right
+  const chartHeight = height - padding.top - padding.bottom
+  const maximum = Math.max(1, ...points.map((point) => point.weightedCost))
+  const coordinates = points.map((point, index) => ({
+    point,
+    x: padding.left + (points.length <= 1 ? chartWidth / 2 : chartWidth * index / (points.length - 1)),
+    y: padding.top + chartHeight * (1 - point.weightedCost / maximum),
+  }))
+  const active = activeIndex === null ? null : coordinates[activeIndex]
+
+  return (
+    <section className="token-chart-card">
+      <header><div><strong>{title}</strong><small>{subtitle}</small></div><span>{points.length} points</span></header>
+      {points.length === 0 ? <div className="chart-empty">No calls recorded</div> : <div className="chart-canvas">
+        <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title}>
+          {[0, 0.5, 1].map((ratio) => {
+            const y = padding.top + chartHeight * ratio
+            const value = maximum * (1 - ratio)
+            return <g key={ratio} className="chart-grid-line">
+              <line x1={padding.left} x2={width - padding.right} y1={y} y2={y} />
+              <text x={padding.left - 6} y={y + 3}>{formatCompactNumber(value)}</text>
+            </g>
+          })}
+          {coordinates.length > 1 && <polyline
+            className="chart-series-line"
+            points={coordinates.map(({ x, y }) => `${x},${y}`).join(' ')}
+            style={{ stroke: color }}
+          />}
+          {coordinates.map(({ point, x, y }, index) => (
+            <g key={point.spanId}>
+              <circle
+                className="chart-hit-point"
+                cx={x}
+                cy={y}
+                r="10"
+                role="button"
+                tabIndex={0}
+                aria-label={`${title} point ${point.index}, cost ${point.weightedCost}`}
+                onMouseEnter={() => setActiveIndex(index)}
+                onMouseLeave={() => setActiveIndex(null)}
+                onFocus={() => setActiveIndex(index)}
+                onBlur={() => setActiveIndex(null)}
+                onClick={() => onSelect(point)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    onSelect(point)
+                    event.preventDefault()
+                  }
+                }}
+              />
+              <circle className="chart-visible-point" cx={x} cy={y} r="3.5" style={{ fill: color, stroke: color }} />
+              {(points.length <= 8 || index === 0 || index === points.length - 1) && (
+                <text className="chart-x-label" x={x} y={height - 8}>{point.index}</text>
+              )}
+            </g>
+          ))}
+        </svg>
+        {active && <div
+          className="chart-tooltip"
+          style={{
+            left: `${Math.min(84, Math.max(16, active.x / width * 100))}%`,
+            top: `${Math.max(18, active.y / height * 100)}%`,
+          }}
+        >
+          <strong>#{active.point.index} · {active.point.label}</strong>
+          <span>Weighted cost <b>{active.point.weightedCost.toLocaleString()}</b></span>
+          <span>Uncached input <b>{active.point.uncachedInputTokens.toLocaleString()}</b></span>
+          <span>Cached <b>{active.point.cachedTokens.toLocaleString()}</b></span>
+          <span>Output <b>{active.point.outputTokens.toLocaleString()}</b></span>
+          {active.point.llmCalls > 1 && <span>LLM calls <b>{active.point.llmCalls}</b></span>}
+        </div>}
+      </div>}
+    </section>
   )
 }
 
@@ -927,6 +1119,13 @@ function formatPreciseTime(value: string): string {
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
   })
   return `${time}.${String(date.getMilliseconds()).padStart(3, '0')}`
+}
+
+function formatCompactNumber(value: number): string {
+  return new Intl.NumberFormat(undefined, {
+    notation: 'compact',
+    maximumFractionDigits: 1,
+  }).format(value)
 }
 
 function formatValue(value: unknown): string {

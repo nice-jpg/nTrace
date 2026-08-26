@@ -66,6 +66,15 @@ function timelineSpan({
   }
 }
 
+function llmTimelineSpan(base: TraceSpan, tokenUsage: Record<string, unknown>): TraceSpan {
+  return {
+    ...base,
+    sender: 'llm',
+    token_usage: tokenUsage,
+    start_event: base.start_event ? { ...base.start_event, sender: 'llm', token_usage: tokenUsage } : null,
+  }
+}
+
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
@@ -192,7 +201,8 @@ describe('trace input details', () => {
     const drawer = container.querySelector('.detail-drawer')
     expect(workspace).toHaveClass('detail-open')
     expect(drawer?.parentElement).toBe(workspace)
-    expect(drawer?.previousElementSibling).toHaveClass('timeline-card')
+    expect(drawer?.previousElementSibling).toHaveClass('trace-main-row')
+    expect(drawer?.previousElementSibling?.querySelector('.timeline-card')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Close details' }))
     expect(container.querySelector('.detail-drawer')).not.toBeInTheDocument()
@@ -281,5 +291,60 @@ describe('trace input details', () => {
     expect(container.querySelectorAll('.connector-layer path')).toHaveLength(2)
     const after = [...container.querySelectorAll('.connector-layer path')].map((path) => path.getAttribute('d'))
     expect(after).not.toEqual(before)
+  })
+
+  it('opens agent token charts and jumps from chart points to span details', async () => {
+    const rootHost = timelineSpan({ spanId: 10, agentId: 1, parentAgentId: null, parentSpanId: null, agentName: 'root', activationOrder: 1, second: 0 })
+    const rootLlm = llmTimelineSpan(
+      timelineSpan({ spanId: 11, agentId: 1, parentAgentId: null, parentSpanId: 10, agentName: 'root', activationOrder: 1, second: 1 }),
+      { input_tokens: 10, output_tokens: 2 },
+    )
+    const childHost = timelineSpan({ spanId: 20, agentId: 2, parentAgentId: 1, parentSpanId: 10, agentName: 'collector', activationOrder: 2, second: 2 })
+    const childLlm = llmTimelineSpan(
+      timelineSpan({ spanId: 21, agentId: 2, parentAgentId: 1, parentSpanId: 20, agentName: 'collector', activationOrder: 2, second: 3 }),
+      { input_tokens: 20, output_tokens: 3, input_token_details: { cached_tokens: 5 } },
+    )
+    const spans = [rootHost, rootLlm, childHost, childLlm]
+    const summary: TraceSummary = {
+      trace_id: 1,
+      started_at: rootHost.started_at,
+      updated_at: childLlm.started_at,
+      status: 'completed',
+      agent_count: 2,
+      span_count: spans.length,
+    }
+    vi.mocked(api.fetchTraces).mockResolvedValue([summary])
+    vi.mocked(api.fetchTrace).mockResolvedValue({
+      ...summary,
+      agents: [
+        { agent_id: 1, parent_agent_id: null, agent_name: 'root', activation_order: 1, first_seen_at: rootHost.started_at },
+        { agent_id: 2, parent_agent_id: 1, agent_name: 'collector', activation_order: 2, first_seen_at: childHost.started_at },
+      ],
+      events: spans.map((span) => span.start_event!),
+      spans,
+    })
+
+    const { container } = render(<App />)
+    await screen.findByRole('heading', { name: 'Trace 1' })
+    fireEvent.click(screen.getByRole('button', { name: 'Show token statistics for agent root' }))
+
+    const panel = screen.getByLabelText('Token statistics for agent root')
+    expect(panel).toBeInTheDocument()
+    expect(screen.getByText('LLM call token cost')).toBeInTheDocument()
+    expect(screen.getByText('Subagent call token cost')).toBeInTheDocument()
+    expect(panel.parentElement).toHaveClass('trace-main-row')
+
+    const llmPoint = screen.getByRole('button', { name: /LLM call token cost point 1/ })
+    fireEvent.mouseEnter(llmPoint)
+    expect(screen.getByText('Weighted cost')).toBeInTheDocument()
+    fireEvent.click(llmPoint)
+    expect(container.querySelector('.detail-drawer')).toBeInTheDocument()
+    expect(container.querySelector('[data-span-id="11"]')).toHaveClass('selected')
+
+    const subagentPoint = screen.getByRole('button', { name: /Subagent call token cost point 1/ })
+    fireEvent.click(subagentPoint)
+    expect(container.querySelector('[data-span-id="20"]')).toHaveClass('selected')
+    expect(container.querySelector('.detail-drawer h2')).toHaveTextContent('collector')
+    expect(container.querySelector('.detail-drawer')?.previousElementSibling).toHaveClass('trace-main-row')
   })
 })
