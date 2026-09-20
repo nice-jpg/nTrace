@@ -143,7 +143,9 @@ def test_trace_list_is_name_only_and_agent_token_stats_load_separately(tmp_path)
         ]
     )
 
-    assert storage.list_traces() == [{"trace_id": 101}]
+    assert storage.list_traces() == [
+        {"trace_id": 101, "display_name": None, "favorite": False}
+    ]
     stats = storage.get_agent_token_statistics(101, 1)
     assert stats is not None
     assert [(point["spanId"], point["weightedCost"]) for point in stats["llmCalls"]] == [(201, 600)]
@@ -153,6 +155,31 @@ def test_trace_list_is_name_only_and_agent_token_stats_load_separately(tmp_path)
     ] == [(300, 1255, 2)]
     assert stats["totalCost"] == 1855
     storage.close()
+
+
+def test_trace_metadata_is_persisted_and_partitions_favorites(tmp_path) -> None:
+    database = tmp_path / "trace.sqlite3"
+    storage = TraceStorage(database)
+    storage.put_events([event("start")])
+
+    updated = storage.update_trace_metadata(
+        101,
+        display_name="Checkout investigation",
+        favorite=True,
+    )
+
+    assert updated == {
+        "trace_id": 101,
+        "display_name": "Checkout investigation",
+        "favorite": True,
+    }
+    assert storage.list_traces() == []
+    assert storage.list_traces(favorite=True) == [updated]
+    storage.close()
+
+    reopened = TraceStorage(database)
+    assert reopened.list_traces(favorite=True) == [updated]
+    reopened.close()
 
 
 def test_span_user_inputs_are_paged_newest_first(tmp_path) -> None:

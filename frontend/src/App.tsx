@@ -9,6 +9,7 @@ import {
   fetchTraces,
   fetchUserInputs,
   openTraceStream,
+  updateTraceMetadata,
 } from './api'
 import {
   LABEL_WIDTH,
@@ -41,9 +42,12 @@ import { getCachedTrace, putCachedTrace } from './traceCache'
 
 const ReactECharts = lazy(() => import('./TokenChartRenderer'))
 
-const Icon = ({ name }: { name: 'trace' | 'activity' | 'chevron' | 'copy' | 'close' }) => {
+type TracePage = 'trace' | 'favorites'
+
+const Icon = ({ name }: { name: 'trace' | 'favorite' | 'activity' | 'chevron' | 'copy' | 'close' }) => {
   const paths = {
     trace: <><path d="M4 18V9m5 9V5m5 13v-7m5 7V3" /><path d="M2 21h20" /></>,
+    favorite: <path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z" />,
     activity: <path d="M3 12h4l2.2-6 4.2 12 2.1-6H21" />,
     chevron: <path d="m9 18 6-6-6-6" />,
     copy: <><rect x="8" y="8" width="11" height="11" rx="2" /><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" /></>,
@@ -66,7 +70,9 @@ interface AgentStatsSelection {
 }
 
 export default function App() {
-  const [traces, setTraces] = useState<TraceListItem[]>([])
+  const [activePage, setActivePage] = useState<TracePage>('trace')
+  const [traceLists, setTraceLists] = useState<Record<TracePage, TraceListItem[]>>({ trace: [], favorites: [] })
+  const [renameTrace, setRenameTrace] = useState<TraceListItem | null>(null)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [detail, setDetail] = useState<TraceDetail | null>(null)
   const [selectedSpan, setSelectedSpan] = useState<SpanSelection | null>(null)
@@ -81,17 +87,36 @@ export default function App() {
   const statsCacheRef = useRef(new Map<number, Map<number, AgentTokenStatistics>>())
   const spanRequestRef = useRef(0)
   const statsRequestRef = useRef(0)
+  const activePageRef = useRef<TracePage>('trace')
+  const loadedPagesRef = useRef(new Set<TracePage>())
+
+  const traces = traceLists[activePage]
 
   useEffect(() => { selectedIdRef.current = selectedId }, [selectedId])
 
-  const refreshTraces = useCallback(async () => {
+  const refreshTraces = useCallback(async (page: TracePage = activePageRef.current) => {
     try {
-      const next = await fetchTraces()
-      setTraces(next)
+      const next = await fetchTraces(page === 'favorites')
+      loadedPagesRef.current.add(page)
+      setTraceLists((current) => ({ ...current, [page]: next }))
       setError('')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))
     }
+  }, [])
+
+  const applyTraceUpdate = useCallback((trace: TraceListItem) => {
+    setTraceLists((current) => {
+      const withoutTrace = {
+        trace: current.trace.filter((item) => item.trace_id !== trace.trace_id),
+        favorites: current.favorites.filter((item) => item.trace_id !== trace.trace_id),
+      }
+      const target: TracePage = trace.favorite ? 'favorites' : 'trace'
+      return { ...withoutTrace, [target]: [trace, ...withoutTrace[target]] }
+    })
+    setDetail((current) => current?.trace_id === trace.trace_id
+      ? { ...current, display_name: trace.display_name, favorite: trace.favorite }
+      : current)
   }, [])
 
   const cacheTrace = useCallback((trace: TraceDetail) => {
@@ -132,16 +157,18 @@ export default function App() {
     traceCacheRef.current.delete(traceId)
     spanCacheRef.current.delete(traceId)
     statsCacheRef.current.delete(traceId)
-    setTraces((current) => current.filter((trace) => trace.trace_id !== traceId))
+    setTraceLists((current) => ({
+      trace: current.trace.filter((trace) => trace.trace_id !== traceId),
+      favorites: current.favorites.filter((trace) => trace.trace_id !== traceId),
+    }))
     if (selectedIdRef.current === traceId) {
       setSelectedSpan(null)
       setSelectedAgentId(null)
       setAgentStats(null)
       setDetail(null)
       setSelectedId(null)
-      void refreshTraces()
     }
-  }, [refreshTraces])
+  }, [])
 
   const deleteTrace = useCallback(async (traceId: number) => {
     try {
@@ -152,6 +179,40 @@ export default function App() {
       setError(reason instanceof Error ? reason.message : String(reason))
     }
   }, [removeTraceLocally])
+
+  const updateTrace = useCallback(async (
+    traceId: number,
+    updates: { display_name?: string; favorite?: boolean },
+  ) => {
+    try {
+      const next = await updateTraceMetadata(traceId, updates)
+      applyTraceUpdate(next)
+      if (updates.favorite !== undefined && selectedIdRef.current === traceId) {
+        setSelectedSpan(null)
+        setSelectedAgentId(null)
+        setAgentStats(null)
+        setDetail(null)
+        setSelectedId(null)
+      }
+      setError('')
+      return true
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+      return false
+    }
+  }, [applyTraceUpdate])
+
+  const switchPage = useCallback((page: TracePage) => {
+    if (page === activePageRef.current) return
+    activePageRef.current = page
+    setActivePage(page)
+    setSelectedSpan(null)
+    setSelectedAgentId(null)
+    setAgentStats(null)
+    setDetail(null)
+    setSelectedId(null)
+    if (!loadedPagesRef.current.has(page)) void refreshTraces(page)
+  }, [refreshTraces])
 
   const selectSpan = useCallback((span: TraceSpan) => {
     spanRequestRef.current += 1
@@ -196,7 +257,7 @@ export default function App() {
     setSelectedSpan(null)
   }, [])
 
-  useEffect(() => { void refreshTraces() }, [refreshTraces])
+  useEffect(() => { void refreshTraces('trace') }, [refreshTraces])
   useEffect(() => { void refreshSelected(selectedId) }, [selectedId, refreshSelected])
   useEffect(() => {
     if (!selectedSpan || selectedSpan.detail || selectedSpan.loading) return
@@ -239,7 +300,9 @@ export default function App() {
   useEffect(() => openTraceStream(
     (event) => {
       setConnected(true)
-      setTraces((current) => updateTraceList(current, event))
+      setTraceLists((current) => current.favorites.some((trace) => trace.trace_id === event.trace_id)
+        ? current
+        : { ...current, trace: updateTraceList(current.trace, event) })
       spanCacheRef.current.get(event.trace_id)?.delete(event.span_id)
       statsCacheRef.current.delete(event.trace_id)
       const cached = traceCacheRef.current.get(event.trace_id)
@@ -256,15 +319,20 @@ export default function App() {
       if (reconnected) void refreshSelected(undefined, true)
     },
     removeTraceLocally,
-  ), [refreshSelected, refreshTraces, removeTraceLocally])
+    applyTraceUpdate,
+  ), [applyTraceUpdate, refreshSelected, refreshTraces, removeTraceLocally])
 
   return (
     <div className="app-shell">
       <nav className="app-nav">
         <div className="brand-mark"><Icon name="activity" /></div>
-        <button className="nav-item active" aria-label="Trace">
+        <button className={`nav-item ${activePage === 'trace' ? 'active' : ''}`} aria-label="Trace" onClick={() => switchPage('trace')}>
           <Icon name="trace" />
           <span>Trace</span>
+        </button>
+        <button className={`nav-item ${activePage === 'favorites' ? 'active' : ''}`} aria-label="Favorites" onClick={() => switchPage('favorites')}>
+          <Icon name="favorite" />
+          <span>Favorites</span>
         </button>
         <div className="nav-spacer" />
         <div className={`connection-dot ${connected ? 'online' : ''}`} title={connected ? 'Live stream connected' : 'Reconnecting'} />
@@ -282,13 +350,17 @@ export default function App() {
           clearSelectedSpan()
         }}
         onDelete={(id) => void deleteTrace(id)}
+        title={activePage === 'favorites' ? 'Favorites' : 'Trace history'}
+        favoritePage={activePage === 'favorites'}
+        onRename={(trace) => setRenameTrace(trace)}
+        onFavorite={(id, favorite) => void updateTrace(id, { favorite })}
       />
 
       <main className={`workspace ${selectedSpan ? 'detail-open' : ''}`}>
         <header className="topbar">
           <div>
             <span className="eyebrow">AGENT SMART TRACE</span>
-            <h1>{detail ? `Trace ${shortId(detail.trace_id)}` : 'Trace timeline'}</h1>
+            <h1>{detail ? traceHeading(detail) : activePage === 'favorites' ? 'Favorite traces' : 'Trace timeline'}</h1>
           </div>
           {detail && (
             <div className="trace-meta">
@@ -330,19 +402,34 @@ export default function App() {
           />
         )}
       </main>
+      {renameTrace && (
+        <RenameTraceDialog
+          trace={renameTrace}
+          onClose={() => setRenameTrace(null)}
+          onSave={async (displayName) => {
+            if (await updateTrace(renameTrace.trace_id, { display_name: displayName })) {
+              setRenameTrace(null)
+            }
+          }}
+        />
+      )}
     </div>
   )
 }
 
 function HistoryPanel({
-  open, traces, selectedId, onToggle, onSelect, onDelete,
+  open, traces, selectedId, title, favoritePage, onToggle, onSelect, onDelete, onRename, onFavorite,
 }: {
   open: boolean
   traces: TraceListItem[]
   selectedId: number | null
+  title: string
+  favoritePage: boolean
   onToggle: () => void
   onSelect: (traceId: number) => void
   onDelete: (traceId: number) => void
+  onRename: (trace: TraceListItem) => void
+  onFavorite: (traceId: number, favorite: boolean) => void
 }) {
   const [contextMenu, setContextMenu] = useState<{ traceId: number; x: number; y: number } | null>(null)
 
@@ -365,7 +452,7 @@ function HistoryPanel({
   return (
     <aside className={`history-panel ${open ? 'open' : 'closed'}`}>
       <div className="history-heading">
-        {open && <><span>Trace history</span><strong>{traces.length}</strong></>}
+        {open && <><span>{title}</span><strong>{traces.length}</strong></>}
         <button onClick={onToggle} aria-label={open ? 'Collapse history' : 'Expand history'}>
           <Icon name="chevron" />
         </button>
@@ -382,11 +469,11 @@ function HistoryPanel({
             }}
           >
             <div className="history-card-top">
-              <code>#{shortId(trace.trace_id)}</code>
+              <code>{traceDisplayName(trace)}</code>
             </div>
           </button>
         ))}
-        {traces.length === 0 && <div className="history-empty">Waiting for the first trace…</div>}
+        {traces.length === 0 && <div className="history-empty">{favoritePage ? 'No favorite traces yet.' : 'Waiting for the first trace…'}</div>}
       </div>}
       {contextMenu && (
         <div
@@ -394,11 +481,27 @@ function HistoryPanel({
           role="menu"
           style={{
             left: Math.min(contextMenu.x, window.innerWidth - 156),
-            top: Math.min(contextMenu.y, window.innerHeight - 52),
+            top: Math.min(contextMenu.y, window.innerHeight - 132),
           }}
           onClick={(event) => event.stopPropagation()}
         >
           <button
+            role="menuitem"
+            onClick={() => {
+              const trace = traces.find((item) => item.trace_id === contextMenu.traceId)
+              if (trace) onRename(trace)
+              setContextMenu(null)
+            }}
+          >Rename</button>
+          <button
+            role="menuitem"
+            onClick={() => {
+              onFavorite(contextMenu.traceId, !favoritePage)
+              setContextMenu(null)
+            }}
+          >{favoritePage ? 'Remove from favorites' : 'Add to favorites'}</button>
+          <button
+            className="danger"
             role="menuitem"
             onClick={() => {
               onDelete(contextMenu.traceId)
@@ -408,6 +511,49 @@ function HistoryPanel({
         </div>
       )}
     </aside>
+  )
+}
+
+function RenameTraceDialog({ trace, onClose, onSave }: {
+  trace: TraceListItem
+  onClose: () => void
+  onSave: (displayName: string) => Promise<void>
+}) {
+  const [value, setValue] = useState(trace.display_name ?? `#${shortId(trace.trace_id)}`)
+  const [saving, setSaving] = useState(false)
+  const submit = async () => {
+    const displayName = value.trim()
+    if (!displayName || saving) return
+    setSaving(true)
+    await onSave(displayName)
+    setSaving(false)
+  }
+  return (
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <form
+        className="rename-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="rename-trace-title"
+        onMouseDown={(event) => event.stopPropagation()}
+        onSubmit={(event) => { event.preventDefault(); void submit() }}
+      >
+        <span className="eyebrow">TRACE NAME</span>
+        <h2 id="rename-trace-title">Rename trace</h2>
+        <input
+          autoFocus
+          maxLength={256}
+          aria-label="Trace name"
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          onKeyDown={(event) => { if (event.key === 'Escape') onClose() }}
+        />
+        <div className="dialog-actions">
+          <button type="button" onClick={onClose}>Cancel</button>
+          <button type="submit" className="primary" disabled={!value.trim() || saving}>{saving ? 'Saving…' : 'Save'}</button>
+        </div>
+      </form>
+    </div>
   )
 }
 
@@ -1270,7 +1416,20 @@ function mergeLiveEvent(detail: TraceDetail, event: TraceEvent): TraceDetail {
 }
 
 function updateTraceList(current: TraceListItem[], event: TraceEvent): TraceListItem[] {
-  return [{ trace_id: event.trace_id }, ...current.filter((trace) => trace.trace_id !== event.trace_id)]
+  const existing = current.find((trace) => trace.trace_id === event.trace_id)
+  return [{
+    trace_id: event.trace_id,
+    display_name: existing?.display_name ?? null,
+    favorite: false,
+  }, ...current.filter((trace) => trace.trace_id !== event.trace_id)]
+}
+
+function traceDisplayName(trace: Pick<TraceListItem, 'trace_id' | 'display_name'>): string {
+  return trace.display_name || `#${shortId(trace.trace_id)}`
+}
+
+function traceHeading(trace: Pick<TraceListItem, 'trace_id' | 'display_name'>): string {
+  return trace.display_name || `Trace ${shortId(trace.trace_id)}`
 }
 
 function llmLabel(span: TraceSpan): string {

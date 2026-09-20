@@ -12,6 +12,7 @@ vi.mock('./api', () => ({
   fetchTraces: vi.fn(),
   fetchUserInputs: vi.fn(),
   openTraceStream: vi.fn(() => () => undefined),
+  updateTraceMetadata: vi.fn(),
 }))
 
 vi.mock('./TokenChartRenderer', () => ({
@@ -185,6 +186,11 @@ describe('trace input details', () => {
         has_more: false,
       })
     vi.mocked(api.deleteTrace).mockResolvedValue()
+    vi.mocked(api.updateTraceMetadata).mockImplementation(async (traceId, updates) => ({
+      trace_id: traceId,
+      display_name: updates.display_name ?? null,
+      favorite: updates.favorite ?? false,
+    }))
 
     const { container } = render(<App />)
     expect(api.fetchSpan).not.toHaveBeenCalled()
@@ -234,6 +240,41 @@ describe('trace input details', () => {
     fireEvent.contextMenu(screen.getByRole('button', { name: '#1' }))
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete trace #1' }))
     await waitFor(() => expect(api.deleteTrace).toHaveBeenCalledWith(1))
+  })
+
+  it('renames traces and moves them between history and favorites', async () => {
+    vi.mocked(api.fetchTraces).mockImplementation(async (favorite) => favorite
+      ? [{ trace_id: 2, display_name: 'Saved trace', favorite: true }]
+      : [{ trace_id: 1, display_name: null, favorite: false }])
+    vi.mocked(api.updateTraceMetadata).mockImplementation(async (traceId, updates) => ({
+      trace_id: traceId,
+      display_name: updates.display_name ?? (traceId === 2 ? 'Saved trace' : null),
+      favorite: updates.favorite ?? traceId === 2,
+    }))
+
+    render(<App />)
+    const historyTrace = await screen.findByRole('button', { name: '#1' })
+    fireEvent.contextMenu(historyTrace)
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename' }))
+    const input = screen.getByRole('textbox', { name: 'Trace name' })
+    fireEvent.change(input, { target: { value: 'Important checkout' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(api.updateTraceMetadata).toHaveBeenCalledWith(1, {
+      display_name: 'Important checkout',
+    }))
+    expect(await screen.findByRole('button', { name: 'Important checkout' })).toBeInTheDocument()
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Important checkout' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Add to favorites' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Important checkout' })).not.toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Favorites' }))
+    expect(await screen.findByRole('button', { name: 'Saved trace' })).toBeInTheDocument()
+    expect(api.fetchTraces).toHaveBeenCalledWith(true)
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'Saved trace' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Remove from favorites' }))
+    await waitFor(() => expect(api.updateTraceMetadata).toHaveBeenCalledWith(2, { favorite: false }))
+    expect(screen.queryByRole('button', { name: 'Saved trace' })).not.toBeInTheDocument()
   })
 
   it('reuses the three most recently visited trace pages and reloads an evicted page', async () => {

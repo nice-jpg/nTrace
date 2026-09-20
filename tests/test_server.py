@@ -19,7 +19,7 @@ def test_api_persists_lists_and_streams_events(tmp_path) -> None:
             assert streamed["event"]["span_id"] == 201
 
         traces = client.get("/api/v1/traces").json()["traces"]
-        assert traces == [{"trace_id": 101}]
+        assert traces == [{"trace_id": 101, "display_name": None, "favorite": False}]
         detail = client.get("/api/v1/traces/101").json()
         assert detail["spans"][0]["running"] is True
         timeline = client.get("/api/v1/traces/101/timeline").json()
@@ -62,6 +62,34 @@ def test_api_deletes_trace_and_broadcasts_removal(tmp_path) -> None:
         assert message == {"kind": "trace.deleted", "trace_id": 101}
         assert client.get("/api/v1/traces/101").status_code == 404
         assert client.delete("/api/v1/traces/101").status_code == 404
+
+
+def test_api_renames_and_moves_trace_to_favorites(tmp_path) -> None:
+    app = create_app(database_path=tmp_path / "server.sqlite3", static_dir=tmp_path / "missing")
+    with TestClient(app) as client:
+        client.post("/api/v1/events", json=event("start"))
+        with client.websocket_connect("/api/v1/stream") as websocket:
+            websocket.receive_json()
+            response = client.patch(
+                "/api/v1/traces/101",
+                json={"display_name": "  Login diagnosis  ", "favorite": True},
+            )
+            streamed = websocket.receive_json()
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "trace_id": 101,
+            "display_name": "Login diagnosis",
+            "favorite": True,
+        }
+        assert streamed == {"kind": "trace.updated", "trace": response.json()}
+        assert client.get("/api/v1/traces").json()["traces"] == []
+        assert client.get("/api/v1/traces?favorite=true").json()["traces"] == [response.json()]
+        timeline = client.get("/api/v1/traces/101/timeline").json()
+        assert timeline["display_name"] == "Login diagnosis"
+        assert timeline["favorite"] is True
+        assert client.patch("/api/v1/traces/101", json={"display_name": "  "}).status_code == 422
+        assert client.patch("/api/v1/traces/101", json={}).status_code == 422
 
 
 def test_api_accepts_single_event_and_validates_sender(tmp_path) -> None:

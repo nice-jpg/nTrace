@@ -1,7 +1,7 @@
 import type { AgentTokenStatistics, TraceDetail, TraceEvent, TraceListItem, TraceSpan } from './types'
 
-export async function fetchTraces(): Promise<TraceListItem[]> {
-  const response = await fetch('/api/v1/traces')
+export async function fetchTraces(favorite = false): Promise<TraceListItem[]> {
+  const response = await fetch(`/api/v1/traces?favorite=${favorite}`)
   if (!response.ok) throw new Error(`Unable to load traces (${response.status})`)
   return (await response.json()).traces
 }
@@ -54,10 +54,24 @@ export async function deleteTrace(traceId: number): Promise<void> {
   if (!response.ok) throw new Error(`Unable to delete trace (${response.status})`)
 }
 
+export async function updateTraceMetadata(
+  traceId: number,
+  updates: { display_name?: string; favorite?: boolean },
+): Promise<TraceListItem> {
+  const response = await fetch(`/api/v1/traces/${traceId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  })
+  if (!response.ok) throw new Error(`Unable to update trace (${response.status})`)
+  return response.json()
+}
+
 export function openTraceStream(
   onEvent: (event: TraceEvent) => void,
   onReady: (reconnected: boolean) => void,
   onDeleted: (traceId: number) => void,
+  onUpdated: (trace: TraceListItem) => void,
 ): () => void {
   let socket: WebSocket | null = null
   let stopped = false
@@ -75,6 +89,7 @@ export function openTraceStream(
       const payload = JSON.parse(message.data)
       if (payload.kind === 'event.created') onEvent(payload.event)
       if (payload.kind === 'trace.deleted') onDeleted(payload.trace_id)
+      if (payload.kind === 'trace.updated') onUpdated(payload.trace)
     }
     socket.onclose = () => {
       if (stopped) return

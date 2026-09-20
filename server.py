@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic import field_validator, model_validator
 
 from .ids import MAX_SAFE_INTEGER
 from .storage import TraceStorage
@@ -49,6 +50,27 @@ class TraceEvent(BaseModel):
 
 class EventPacket(BaseModel):
     events: list[TraceEvent] = Field(min_length=1, max_length=1_000)
+
+
+class TraceMetadataUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=256)
+    favorite: bool | None = None
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("display_name must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def require_change(self) -> "TraceMetadataUpdate":
+        if self.display_name is None and self.favorite is None:
+            raise ValueError("At least one trace field must be provided")
+        return self
 
 
 class StreamHub:
@@ -100,7 +122,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
         allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["*"],
     )
 
@@ -118,8 +140,23 @@ def create_app(
         return {"accepted": len(events), "stored": len(stored)}
 
     @app.get("/api/v1/traces")
-    async def list_traces(limit: int = Query(default=100, ge=1, le=1_000)) -> dict[str, Any]:
-        return {"traces": storage.list_traces(limit)}
+    async def list_traces(
+        limit: int = Query(default=100, ge=1, le=1_000),
+        favorite: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        return {"traces": storage.list_traces(limit, favorite=favorite)}
+
+    @app.patch("/api/v1/traces/{trace_id}")
+    async def update_trace(trace_id: int, update: TraceMetadataUpdate) -> dict[str, Any]:
+        trace = storage.update_trace_metadata(
+            trace_id,
+            display_name=update.display_name,
+            favorite=update.favorite,
+        )
+        if trace is None:
+            raise HTTPException(status_code=404, detail="Trace not found")
+        await stream.broadcast({"kind": "trace.updated", "trace": trace})
+        return trace
 
     @app.get("/api/v1/traces/{trace_id}")
     async def get_trace(trace_id: int) -> dict[str, Any]:

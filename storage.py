@@ -33,7 +33,9 @@ class TraceStorage:
                 trace_id INTEGER PRIMARY KEY,
                 started_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'running'
+                status TEXT NOT NULL DEFAULT 'running',
+                display_name TEXT,
+                favorite INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS agents (
                 trace_id INTEGER NOT NULL,
@@ -92,6 +94,16 @@ class TraceStorage:
         if "token_usage_known" not in columns:
             self._connection.execute(
                 "ALTER TABLE events ADD COLUMN token_usage_known INTEGER NOT NULL DEFAULT 0"
+            )
+        trace_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(traces)").fetchall()
+        }
+        if "display_name" not in trace_columns:
+            self._connection.execute("ALTER TABLE traces ADD COLUMN display_name TEXT")
+        if "favorite" not in trace_columns:
+            self._connection.execute(
+                "ALTER TABLE traces ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"
             )
         self._connection.execute(
             """
@@ -324,23 +336,65 @@ class TraceStorage:
                 }
         return None
 
-    def list_traces(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_traces(
+        self,
+        limit: int = 100,
+        *,
+        favorite: bool = False,
+    ) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT trace_id
+                SELECT trace_id, display_name, favorite
                 FROM traces
+                WHERE favorite=?
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (max(1, min(1_000, int(limit))),),
+                (int(favorite), max(1, min(1_000, int(limit)))),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            {**dict(row), "favorite": bool(row["favorite"])}
+            for row in rows
+        ]
+
+    def update_trace_metadata(
+        self,
+        trace_id: int,
+        *,
+        display_name: str | None = None,
+        favorite: bool | None = None,
+    ) -> dict[str, Any] | None:
+        assignments: list[str] = []
+        values: list[Any] = []
+        if display_name is not None:
+            assignments.append("display_name=?")
+            values.append(display_name)
+        if favorite is not None:
+            assignments.append("favorite=?")
+            values.append(int(favorite))
+        if not assignments:
+            return None
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                f"UPDATE traces SET {', '.join(assignments)} WHERE trace_id=?",
+                (*values, trace_id),
+            )
+            if not cursor.rowcount:
+                return None
+            row = self._connection.execute(
+                "SELECT trace_id, display_name, favorite FROM traces WHERE trace_id=?",
+                (trace_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {**dict(row), "favorite": bool(row["favorite"])}
 
     def get_trace(self, trace_id: int) -> dict[str, Any] | None:
         with self._lock:
             trace = self._connection.execute(
-                "SELECT trace_id, started_at, updated_at, status FROM traces WHERE trace_id=?",
+                """SELECT trace_id, started_at, updated_at, status, display_name, favorite
+                   FROM traces WHERE trace_id=?""",
                 (trace_id,),
             ).fetchone()
             if trace is None:
@@ -359,6 +413,7 @@ class TraceStorage:
         events = [json.loads(row["payload_json"]) for row in rows]
         return {
             **dict(trace),
+            "favorite": bool(trace["favorite"]),
             "agents": [dict(row) for row in agents],
             "events": events,
             "spans": assemble_spans(events),
@@ -369,7 +424,8 @@ class TraceStorage:
 
         with self._lock:
             trace = self._connection.execute(
-                "SELECT trace_id, started_at, updated_at, status FROM traces WHERE trace_id=?",
+                """SELECT trace_id, started_at, updated_at, status, display_name, favorite
+                   FROM traces WHERE trace_id=?""",
                 (trace_id,),
             ).fetchone()
             if trace is None:
@@ -420,6 +476,7 @@ class TraceStorage:
         )
         return {
             **dict(trace),
+            "favorite": bool(trace["favorite"]),
             "agent_count": len(agents),
             "span_count": len(spans),
             "agents": agents,

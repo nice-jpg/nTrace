@@ -43,6 +43,8 @@ export interface AgentSummary {
 
 export interface TraceSummary {
   trace_id: number
+  display_name?: string | null
+  favorite?: boolean
   started_at: string
   updated_at: string
   status: 'running' | 'completed'
@@ -52,6 +54,8 @@ export interface TraceSummary {
 
 export interface TraceListItem {
   trace_id: number
+  display_name?: string | null
+  favorite?: boolean
 }
 
 export interface TokenCostBreakdown {
