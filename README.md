@@ -70,6 +70,46 @@ timeline uses `GET /api/v1/traces/{trace_id}/timeline`. Non-input span details l
 newest-first through `GET /api/v1/traces/{trace_id}/spans/{span_id}/user-inputs`.
 Live updates use `WS /api/v1/stream`.
 
+## Large contexts and reverse proxies
+
+The SDK compresses event packets of at least 64 KiB with gzip, splits batches above
+512 KiB on the wire (or 8 MiB before compression), and splits multi-event batches
+again if the proxy returns HTTP 413. Single events remain intact: context fields are
+never truncated to fit a request. The receiver accepts both ordinary JSON and gzip
+JSON, validates the same event schema, and limits both transmitted and decoded
+bodies to 64 MiB. Upgrade/restart the receiver **before** upgrading/restarting Agent
+processes: older receivers cannot decode compressed requests. No frontend rebuild or
+database migration is required.
+
+Nginx defaults to a 1 MiB request-body limit. Large host/start contexts can exceed
+this limit while smaller LLM/end packets still succeed, leaving missing/open host
+spans and end-only LLM spans displayed with zero duration. Refreshing cannot recover
+events that never reached storage. For large individual events, configure the
+existing API proxy location, for example:
+
+```nginx
+location /api/ {
+    client_max_body_size 64m;
+    proxy_pass http://127.0.0.1:8765;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+}
+```
+
+Validate with `sudo nginx -t`, then reload with `sudo systemctl reload nginx`.
+Keep any existing authentication and other proxy settings. If a more specific
+location handles `/api/v1/events`, apply the body limit there instead. Nginx's
+`gzip on` response setting is not a substitute for decoding request bodies.
+
+Failed uploads log a WARNING with HTTP status (when available), byte/event counts,
+and the first event's trace/span IDs, without logging context contents. They increment
+`dropped_events`; Agent execution remains fail-open. A single event beyond the
+receiver's decoded-body limit is rejected explicitly. `flush()` waits for queued
+and in-flight delivery attempts, not just an empty queue; it does not guarantee
+successful delivery. Previously dropped events cannot be reconstructed by this fix.
+
 ## Tests
 
 ```bash

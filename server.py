@@ -6,13 +6,17 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
+import gzip
+import io
 import os
 from pathlib import Path
 from typing import Any, Literal
+import zlib
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic import field_validator, model_validator
@@ -22,6 +26,44 @@ from .storage import TraceStorage
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / "data" / "ntrace.sqlite3"
 DEFAULT_STATIC = Path(__file__).resolve().parent / "frontend" / "dist"
+MAX_EVENT_BODY_BYTES = 64 * 1024 * 1024
+
+
+class EventRequest(Request):
+    """Decode compressed telemetry before FastAPI's normal schema validation."""
+
+    async def body(self) -> bytes:
+        if not hasattr(self, "_body"):
+            encoding = self.headers.get("content-encoding", "identity").strip().lower()
+            if encoding not in {"identity", "gzip"}:
+                raise HTTPException(415, "Unsupported Content-Encoding")
+            body = bytearray()
+            async for chunk in self.stream():
+                if len(body) + len(chunk) > MAX_EVENT_BODY_BYTES:
+                    raise HTTPException(413, "Event packet exceeds body limit")
+                body.extend(chunk)
+            if encoding == "gzip":
+                try:
+                    with gzip.GzipFile(fileobj=io.BytesIO(body)) as compressed:
+                        decoded = compressed.read(MAX_EVENT_BODY_BYTES + 1)
+                except (OSError, EOFError, zlib.error) as error:
+                    raise HTTPException(400, "Invalid gzip event packet") from error
+                if len(decoded) > MAX_EVENT_BODY_BYTES:
+                    raise HTTPException(413, "Decoded event packet exceeds body limit")
+                self._body = decoded
+            else:
+                self._body = bytes(body)
+        return self._body
+
+
+class EventRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def receive(request: Request):
+            return await handler(EventRequest(request.scope, request.receive))
+
+        return receive
 
 
 class TraceEvent(BaseModel):
@@ -130,7 +172,9 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/api/v1/events")
+    events_router = APIRouter(route_class=EventRoute)
+
+    @events_router.post("/api/v1/events")
     async def receive_events(packet: EventPacket | TraceEvent) -> dict[str, int]:
         models = packet.events if isinstance(packet, EventPacket) else [packet]
         events = [model.model_dump(mode="json") for model in models]
@@ -138,6 +182,8 @@ def create_app(
         for event in stored:
             await stream.broadcast({"kind": "event.created", "event": _timeline_event(event)})
         return {"accepted": len(events), "stored": len(stored)}
+
+    app.include_router(events_router)
 
     @app.get("/api/v1/traces")
     async def list_traces(

@@ -1,9 +1,44 @@
 from __future__ import annotations
 
+import gzip
+import json
+
 from fastapi.testclient import TestClient
 
 from nTrace.server import create_app
 from nTrace.tests.test_storage import event
+
+
+def test_compressed_packets_validate_and_broadcast(tmp_path):
+    app = create_app(database_path=tmp_path / "server.sqlite3", static_dir=tmp_path / "missing")
+    headers = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
+    packet = gzip.compress(json.dumps({"events": [event()]}).encode())
+    with TestClient(app) as client:
+        with client.websocket_connect("/api/v1/stream") as websocket:
+            websocket.receive_json()
+            response = client.post("/api/v1/events", content=packet, headers=headers)
+            assert response.json() == {"accepted": 1, "stored": 1}
+            assert websocket.receive_json()["event"]["span_id"] == 201
+        assert client.post("/api/v1/events", content=packet, headers=headers).json()["stored"] == 0
+        invalid = gzip.compress(json.dumps(event(sender="invalid")).encode())
+        assert client.post("/api/v1/events", content=invalid, headers=headers).status_code == 422
+        assert client.post("/api/v1/events", content=b"bad gzip", headers=headers).status_code == 400
+        assert client.post("/api/v1/events", content=packet[:-5], headers=headers).status_code == 400
+
+
+def test_receiver_limits_compressed_and_decoded_bodies(tmp_path, monkeypatch):
+    monkeypatch.setattr("nTrace.server.MAX_EVENT_BODY_BYTES", 1024)
+    app = create_app(database_path=tmp_path / "server.sqlite3", static_dir=tmp_path / "missing")
+    body = json.dumps(event(user_inputs=["x" * 2000])).encode()
+    with TestClient(app) as client:
+        headers = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
+        assert client.post("/api/v1/events", content=gzip.compress(body), headers=headers).status_code == 413
+        assert client.post("/api/v1/events", content=body, headers=headers).status_code == 413
+        assert client.post("/api/v1/events", content=body,
+                           headers={"Content-Type": "application/json"}).status_code == 413
+        assert client.post("/api/v1/events", content=b"{}",
+                           headers={"Content-Encoding": "br"}).status_code == 415
+        assert client.get("/api/v1/traces").json()["traces"] == []
 
 
 def test_api_persists_lists_and_streams_events(tmp_path) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import gzip
 from functools import lru_cache
 import json
 import logging
@@ -12,8 +13,12 @@ import threading
 import time
 from typing import Any
 from urllib import request
+from urllib.error import HTTPError
 
 LOGGER = logging.getLogger("nTrace.client")
+MAX_BATCH_BYTES = 512 * 1024
+MAX_RAW_BATCH_BYTES = 8 * 1024 * 1024
+COMPRESS_THRESHOLD = 64 * 1024
 
 
 class NTraceClient:
@@ -60,10 +65,15 @@ class NTraceClient:
             return False
 
     def flush(self, timeout: float = 1.0) -> bool:
+        """Wait for queued and in-flight events to finish their delivery attempts."""
         deadline = time.monotonic() + max(0.0, timeout)
-        while not self._queue.empty() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        return self._queue.empty()
+        with self._queue.all_tasks_done:
+            while self._queue.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._queue.all_tasks_done.wait(remaining)
+        return True
 
     def close(self) -> None:
         self.flush(0.5)
@@ -102,23 +112,59 @@ class NTraceClient:
                     self._queue.task_done()
 
     def _post(self, events: list[dict[str, Any]]) -> bool:
-        body = json.dumps({"events": events}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        try:
+            body = json.dumps({"events": events}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError):
+            if len(events) > 1:
+                return self._split_post(events)
+            self.dropped_events += len(events)
+            LOGGER.warning("nTrace event is not JSON serializable; dropped_events=%s", self.dropped_events)
+            return False
+        if len(body) > MAX_RAW_BATCH_BYTES and len(events) > 1:
+            return self._split_post(events)
+        headers = {"Content-Type": "application/json"}
+        if len(body) >= COMPRESS_THRESHOLD:
+            body = gzip.compress(body, compresslevel=1, mtime=0)
+            headers["Content-Encoding"] = "gzip"
+        if len(body) > MAX_BATCH_BYTES and len(events) > 1:
+            return self._split_post(events)
         for attempt in range(self.max_retries + 1):
             try:
                 req = request.Request(
                     f"{self.server_url}/api/v1/events",
                     data=body,
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                     method="POST",
                 )
                 with request.urlopen(req, timeout=self.request_timeout) as response:  # noqa: S310 - configured local endpoint.
-                    return 200 <= response.status < 300
+                    if 200 <= response.status < 300:
+                        return True
+                    raise HTTPError(req.full_url, response.status, "Upload rejected", {}, None)
             except Exception as error:  # noqa: BLE001 - telemetry is deliberately fail-open.
-                if attempt >= self.max_retries:
-                    LOGGER.debug("nTrace upload failed: %s", error)
+                status = error.code if isinstance(error, HTTPError) else None
+                if isinstance(error, HTTPError):
+                    error.close()
+                if status == 413 and len(events) > 1:
+                    return self._split_post(events)
+                if status == 413 or attempt >= self.max_retries:
+                    self.dropped_events += len(events)
+                    LOGGER.warning(
+                        "nTrace upload failed; status=%s error_type=%s events=%s bytes=%s "
+                        "trace_id=%s span_id=%s dropped_events=%s%s",
+                        status, type(error).__name__, len(events), len(body),
+                        events[0].get("trace_id"), events[0].get("span_id"), self.dropped_events,
+                        "; increase proxy client_max_body_size / receiver body limit" if status == 413 else "",
+                    )
                     return False
                 time.sleep(0.05 * (2**attempt))
         return False
+
+    def _split_post(self, events: list[dict[str, Any]]) -> bool:
+        midpoint = len(events) // 2
+        first = self._post(events[:midpoint])
+        # Always attempt the second half, even if an individual event was rejected.
+        second = self._post(events[midpoint:])
+        return first and second
 
 
 @lru_cache(maxsize=1)
