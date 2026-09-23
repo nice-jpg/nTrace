@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
 import pytest
@@ -38,7 +39,7 @@ def test_large_context_survives_proxy_body_limit(monkeypatch, receiver):
         requests.append(len(req.data))
         if len(req.data) > 1024 * 1024:
             raise HTTPError(req.full_url, 413, "Request Entity Too Large", {}, None)
-        response = api.post("/api/v1/events", content=req.data, headers=dict(req.header_items()))
+        response = api.post(urlsplit(req.full_url).path, content=req.data, headers=dict(req.header_items()))
         assert response.status_code == 200, response.text
         return Reply()
 
@@ -92,6 +93,54 @@ def test_flush_waits_for_in_flight_upload(monkeypatch):
         client.close()
 
 
+def test_remote_upload_has_configurable_timeout(monkeypatch):
+    monkeypatch.delenv("NTRACE_REQUEST_TIMEOUT", raising=False)
+    observed = []
+
+    def slow_receiver(req, *, timeout):
+        observed.append(timeout)
+        if timeout < 2:
+            raise TimeoutError("remote upload exceeds one second")
+        return Reply()
+
+    monkeypatch.setattr("nTrace.client.request.urlopen", slow_receiver)
+    client = NTraceClient(enabled=True, max_retries=0)
+    try:
+        assert client._post([event()])
+        assert observed == [30.0]
+        assert client.dropped_events == 0
+    finally:
+        client.close()
+    monkeypatch.setenv("NTRACE_REQUEST_TIMEOUT", "90")
+    assert NTraceClient(enabled=False).request_timeout == 90
+    assert NTraceClient(enabled=False, request_timeout=5).request_timeout == 5
+
+
+@pytest.mark.parametrize("value", ["invalid", "nan", "inf", "0", "-1"])
+def test_invalid_timeout_environment_is_fail_open(monkeypatch, value, caplog):
+    monkeypatch.setenv("NTRACE_REQUEST_TIMEOUT", value)
+    assert NTraceClient(enabled=False).request_timeout == 30
+    assert "NTRACE_REQUEST_TIMEOUT" in caplog.text
+
+
+@pytest.mark.parametrize("reason", [TimeoutError("private content"), ConnectionRefusedError(61, "private content")])
+def test_url_error_logs_underlying_cause(monkeypatch, reason, caplog):
+    def fail(req, **kwargs):
+        raise URLError(reason)
+
+    monkeypatch.setattr("nTrace.client.request.urlopen", fail)
+    client = NTraceClient(enabled=True, max_retries=0)
+    try:
+        assert not client._post([event()])
+        assert f"reason_type={type(reason).__name__}" in caplog.text
+        assert "timeout_s=" in caplog.text
+        assert "elapsed_s=" in caplog.text
+        assert "raw_bytes=" in caplog.text
+        assert "private content" not in caplog.text
+    finally:
+        client.close()
+
+
 def test_413_splits_batch_and_preserves_other_events(monkeypatch, caplog):
     received = []
     attempts = []
@@ -119,20 +168,22 @@ def test_413_splits_batch_and_preserves_other_events(monkeypatch, caplog):
 
 
 def test_encoded_byte_limit_splits_before_post(monkeypatch):
-    monkeypatch.setattr("nTrace.client.MAX_BATCH_BYTES", 650)
+    monkeypatch.setattr("nTrace.client.MAX_BATCH_BYTES", 1100)
     sizes = []
+    received = []
 
     def proxy(req, **kwargs):
         sizes.append(len(req.data))
-        assert len(json.loads(req.data)["events"]) == 1
+        received.extend(item["span_id"] for item in json.loads(req.data)["events"])
         return Reply()
 
     monkeypatch.setattr("nTrace.client.request.urlopen", proxy)
     client = NTraceClient(enabled=True)
     try:
         assert client._post([event(span_id=i) for i in range(4)])
-        assert len(sizes) == 4
-        assert max(sizes) <= 650
+        assert len(sizes) >= 2
+        assert received == list(range(4))
+        assert max(sizes) <= 1100
     finally:
         client.close()
 
@@ -183,7 +234,7 @@ def test_raw_byte_limit_splits_highly_compressible_batch(monkeypatch, receiver):
     counts = []
 
     def proxy(req, **kwargs):
-        response = api.post("/api/v1/events", content=req.data, headers=dict(req.header_items()))
+        response = api.post(urlsplit(req.full_url).path, content=req.data, headers=dict(req.header_items()))
         assert response.status_code == 200
         counts.append(response.json()["accepted"])
         return Reply()
@@ -191,7 +242,7 @@ def test_raw_byte_limit_splits_highly_compressible_batch(monkeypatch, receiver):
     monkeypatch.setattr("nTrace.client.request.urlopen", proxy)
     client = NTraceClient(enabled=True)
     try:
-        assert client._post([event(span_id=i, user_inputs=["x" * 80_000]) for i in range(4)])
+        assert client._post([event(span_id=i, user_inputs=[str(i) * 80_000]) for i in range(4)])
         assert counts == [1, 1, 1, 1]
         assert len(storage.get_trace(101)["events"]) == 4
     finally:

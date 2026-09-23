@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 import json
 from pathlib import Path
 import sqlite3
 import threading
 from typing import Any
+
+from .snapshots import MissingSnapshot, digest, encode_events, resolve_event
 
 
 class TraceStorage:
@@ -36,6 +39,15 @@ class TraceStorage:
                 status TEXT NOT NULL DEFAULT 'running',
                 display_name TEXT,
                 favorite INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS trace_snapshots (
+                trace_id INTEGER NOT NULL REFERENCES traces(trace_id) ON DELETE CASCADE,
+                snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id),
+                PRIMARY KEY(trace_id, snapshot_id)
             );
             CREATE TABLE IF NOT EXISTS agents (
                 trace_id INTEGER NOT NULL,
@@ -171,6 +183,20 @@ class TraceStorage:
                         timestamp,
                     ),
                 )
+                encoded, objects = encode_events([event])
+                # Contextualization adds source_trace_id; retain the client's original
+                # context root too, since successful delivery acknowledges that hash.
+                _, source_objects = encode_events([raw_event])
+                objects.update(source_objects)
+                self._connection.executemany(
+                    "INSERT OR IGNORE INTO snapshots VALUES (?, ?)",
+                    [(key, json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+                     for key, value in objects.items()],
+                )
+                self._connection.executemany(
+                    "INSERT OR IGNORE INTO trace_snapshots VALUES (?, ?)",
+                    [(trace_id, key) for key in objects],
+                )
                 cursor = self._connection.execute(
                     """
                     INSERT INTO events(
@@ -189,12 +215,42 @@ class TraceStorage:
                         int(event["agent_id"]),
                         event.get("parent_span_id"),
                         json.dumps(event.get("token_usage") or {}, ensure_ascii=False, separators=(",", ":")),
-                        json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps({**encoded[0], "_snapshot_version": 1}, ensure_ascii=False, separators=(",", ":")),
                     ),
                 )
                 if cursor.rowcount:
                     stored.append(event)
         return stored
+
+    def _snapshot(self, key: str) -> Any:
+        row = self._connection.execute("SELECT payload_json FROM snapshots WHERE snapshot_id=?", (key,)).fetchone()
+        if row is None:
+            raise MissingSnapshot("Referenced context snapshot is missing")
+        return json.loads(row[0])
+
+    def _read_payload(self, payload: str, fields: tuple[str, ...] | None = None) -> dict:
+        event = json.loads(payload)
+        version = event.pop("_snapshot_version", None)
+        if fields is not None:
+            event = {key: value for key, value in event.items() if key in fields}
+        if version == 1:
+            return resolve_event(event, self._snapshot)
+        return event
+
+    def put_snapshot_events(
+        self, events: list[dict], objects: dict, validate: Callable[[dict], dict],
+    ) -> list[dict]:
+        with self._lock:
+            for key, value in objects.items():
+                if digest(value) != key:
+                    raise ValueError("Snapshot content hash mismatch")
+
+            def lookup(key: str) -> Any:
+                return objects[key] if key in objects else self._snapshot(key)
+
+            # Resolve and validate the entire batch before changing persistent state.
+            resolved = [validate(resolve_event(event, lookup)) for event in events]
+            return self.put_events(resolved)
 
     def _contextualize_event(self, raw_event: dict[str, Any]) -> dict[str, Any]:
         """Map an agent-local trace into the active server-side invocation tree."""
@@ -325,7 +381,7 @@ class TraceStorage:
             (timestamp,),
         ).fetchall()
         for row in rows:
-            payload = json.loads(row["payload_json"])
+            payload = self._read_payload(row["payload_json"], ("tools_called", "parent_span_id", "timestamp"))
             parent_span_id = payload.get("parent_span_id")
             if payload.get("tools_called") and parent_span_id is not None:
                 return {
@@ -410,7 +466,7 @@ class TraceStorage:
                 "SELECT payload_json FROM events WHERE trace_id=? ORDER BY timestamp, event_type DESC",
                 (trace_id,),
             ).fetchall()
-        events = [json.loads(row["payload_json"]) for row in rows]
+            events = [self._read_payload(row["payload_json"]) for row in rows]
         return {
             **dict(trace),
             "favorite": bool(trace["favorite"]),
@@ -611,7 +667,7 @@ class TraceStorage:
                 """,
                 (trace_id, span_id),
             ).fetchall()
-        spans = assemble_spans([json.loads(row["payload_json"]) for row in rows])
+            spans = assemble_spans([self._read_payload(row["payload_json"]) for row in rows])
         return spans[0] if spans else None
 
     def get_span_details(self, trace_id: int, span_id: int) -> dict[str, Any] | None:
@@ -662,6 +718,9 @@ class TraceStorage:
             self._connection.execute(
                 "DELETE FROM trace_contexts WHERE root_trace_id=? OR source_trace_id=?",
                 (trace_id, trace_id),
+            )
+            self._connection.execute(
+                "DELETE FROM snapshots WHERE snapshot_id NOT IN (SELECT snapshot_id FROM trace_snapshots)"
             )
         return bool(cursor.rowcount)
 

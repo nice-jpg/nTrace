@@ -23,6 +23,7 @@ from pydantic import field_validator, model_validator
 
 from .ids import MAX_SAFE_INTEGER
 from .storage import TraceStorage
+from .snapshots import MissingSnapshot
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / "data" / "ntrace.sqlite3"
 DEFAULT_STATIC = Path(__file__).resolve().parent / "frontend" / "dist"
@@ -92,6 +93,12 @@ class TraceEvent(BaseModel):
 
 class EventPacket(BaseModel):
     events: list[TraceEvent] = Field(min_length=1, max_length=1_000)
+
+
+class SnapshotPacket(BaseModel):
+    snapshot_version: Literal[1]
+    events: list[dict[str, Any]] = Field(min_length=1, max_length=1_000)
+    objects: dict[str, Any] = Field(default_factory=dict)
 
 
 class TraceMetadataUpdate(BaseModel):
@@ -182,6 +189,21 @@ def create_app(
         for event in stored:
             await stream.broadcast({"kind": "event.created", "event": _timeline_event(event)})
         return {"accepted": len(events), "stored": len(stored)}
+
+    @events_router.post("/api/v1/snapshot-events")
+    async def receive_snapshots(packet: SnapshotPacket) -> dict[str, int]:
+        try:
+            stored = storage.put_snapshot_events(
+                packet.events, packet.objects,
+                lambda event: TraceEvent.model_validate(event).model_dump(mode="json"),
+            )
+        except MissingSnapshot as error:
+            raise HTTPException(409, str(error)) from error
+        except (ValueError, TypeError, RecursionError) as error:
+            raise HTTPException(422, "Invalid context snapshot packet") from error
+        for event in stored:
+            await stream.broadcast({"kind": "event.created", "event": _timeline_event(event)})
+        return {"accepted": len(packet.events), "stored": len(stored)}
 
     app.include_router(events_router)
 
