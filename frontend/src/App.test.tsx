@@ -115,6 +115,33 @@ describe('trace input details', () => {
     expect(screen.getByText(/"query": "shop"/)).toBeInTheDocument()
   })
 
+  it.each(['host', 'tool'] as const)('shows only relevant %s details and all three lanes', async (sender) => {
+    const span = { ...timelineSpan({ spanId: 2, agentId: 1, parentAgentId: null, parentSpanId: null,
+      agentName: 'main', activationOrder: 1, second: 0 }), sender }
+    const detail: TraceDetail = {
+      trace_id: 1, started_at: span.started_at, updated_at: span.started_at, status: 'running',
+      agent_count: 1, span_count: 1, events: [], spans: [span],
+      agents: [{ agent_id: 1, parent_agent_id: null, agent_name: 'main', activation_order: 1, first_seen_at: span.started_at }],
+    }
+    vi.mocked(api.fetchTraces).mockResolvedValue([{ trace_id: 1 }])
+    vi.mocked(api.fetchTrace).mockResolvedValue(detail)
+    vi.mocked(api.fetchSpan).mockResolvedValue(span)
+    const { container } = render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: '#1' }))
+    fireEvent.click(await screen.findByTitle(new RegExp(sender.toUpperCase())))
+    expect(container.querySelectorAll('.lane')).toHaveLength(3)
+    expect(screen.queryByText('System prompt')).not.toBeInTheDocument()
+    expect(screen.queryByText(/^User inputs/)).not.toBeInTheDocument()
+    if (sender === 'host') {
+      expect(screen.getByText('Agent state')).toBeInTheDocument()
+      expect(screen.queryByText('Tool arguments')).not.toBeInTheDocument()
+    } else {
+      expect(screen.getByText('Tool arguments')).toBeInTheDocument()
+      expect(screen.getByText('Tool result')).toBeInTheDocument()
+      expect(screen.queryByText('Agent state')).not.toBeInTheDocument()
+    }
+  })
+
   it('places the expanded detail drawer after the timeline so it consumes workspace height', async () => {
     const startEvent: TraceEvent = {
       schema_version: 1,
@@ -125,7 +152,7 @@ describe('trace input details', () => {
       parent_agent_id: null,
       agent_name: 'main',
       activation_order: 1,
-      sender: 'host',
+      sender: 'llm',
       type: 'start',
       timestamp: '2026-01-01T00:00:00.000Z',
       system_prompt: 'system',
@@ -196,7 +223,7 @@ describe('trace input details', () => {
     expect(api.fetchSpan).not.toHaveBeenCalled()
     expect(api.fetchTrace).not.toHaveBeenCalled()
     fireEvent.click(await screen.findByRole('button', { name: '#1' }))
-    fireEvent.click(await screen.findByTitle(/HOST/))
+    fireEvent.click(await screen.findByTitle(/LLM/))
 
     await waitFor(() => expect(container.querySelector('.detail-drawer')).toBeInTheDocument())
     await waitFor(() => expect(api.fetchSpan).toHaveBeenCalledWith(1, 2))

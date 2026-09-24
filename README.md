@@ -1,6 +1,6 @@
 # nTrace
 
-Local-first smart trace for the Bines LangChain agents. It records host and LLM spans,
+Local-first smart trace for the Bines LangChain agents. It records host, LLM and tool spans,
 persists them in SQLite, streams new events over WebSocket, and renders a multi-agent
 timeline in React.
 
@@ -43,6 +43,50 @@ HTTP and WebSocket traffic to the Python server.
 
 ## Agent integration
 
+The public stage interface is the abstract `NTraceMiddleware(AgentMiddleware)`.
+Its shared sender is fail-open; `HostTraceMiddleware`, `LLMTraceMiddleware` and
+`ToolTraceMiddleware` inherit directly from it. All three factories return
+`NTraceMiddleware`:
+
+```python
+from nTrace import (
+    NTrace, createNTraceHostMiddleware, createNTraceLLMMiddleware,
+    createNTraceToolMiddleware,
+)
+
+trace = NTrace(agent_name="example")
+middleware = [
+    createNTraceHostMiddleware(trace),
+    createNTraceLLMMiddleware(trace),
+    createNTraceToolMiddleware(trace),
+]
+# Pass middleware to LangChain create_agent(..., middleware=middleware).
+```
+
+- Host: starts at `before_agent`, captures prepared AgentState at `before_model`.
+  After a model requests tools, preparation for the next model iteration starts
+  at `after_model`; subsequent `before_model` captures its updated state. A model
+  revisit without a pending host interval captures a new start/end state pair.
+  Normal termination without another model closes any pending interval.
+- LLM: `wrap_model_call` / `awrap_model_call` record actual input messages/system
+  prompt and output messages/token usage, without duplicate raw state or tool definitions.
+  Place this wrapper inside request-transforming wrappers to capture their final input.
+- Tool: `wrap_tool_call` / `awrap_tool_call` record name, call ID, arguments and result
+  (including `Command` results), with a separate span per concurrent execution.
+  Exceptions close the span and are re-raised unchanged.
+
+The UI has three sublanes and stage-specific lazy details: Agent state, model
+inputs/output and token usage, or tool arguments/result. Child-agent connectors can
+originate from active tool spans. SQLite upgrades the old host/LLM CHECK constraint
+transactionally on startup, preserving event rows and indexes; back up the database
+before upgrading a production service. Rebuild and deploy the frontend as well.
+
+**`src/agent_runtime` is intentionally unchanged.** The old
+`createNTraceStartMiddleware` / `createNTraceEndMiddleware` remain compatibility
+factories with their existing behavior; do not combine them with the new factories.
+Existing runtime integrations therefore do not automatically emit tool spans until
+they are explicitly migrated to the three-stage middleware list.
+
 Trace construction is internal to each Bines agent.
 Callers create and run `AgentRuntime` normally; no trace object or trace identifier is
 passed through public constructors. Before each `run_turn`, the agent replaces its sole
@@ -54,7 +98,7 @@ context. Collectors do not carry the user-input boundary; the server infers thei
 parent/child relationships from host-span timing and recent tool calls, then persists the
 resulting trace tree.
 
-For every model iteration, the first trace middleware emits a host start from
+In the compatibility integration, for every model iteration, the first trace middleware emits a host start from
 `before_model`, the last trace middleware collects the prepared state and emits the
 matching host end from `before_model`, and its `wrap_model_call` emits the LLM start/end
 pair. The UI timeline advances only when an event arrives, so idle wall-clock time does

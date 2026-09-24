@@ -1,4 +1,4 @@
-export type Sender = 'host' | 'llm'
+export type Sender = 'host' | 'llm' | 'tool'
 export type EventType = 'start' | 'end'
 
 export interface TraceEvent {

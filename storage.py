@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 import json
+import re
 from pathlib import Path
 import sqlite3
 import threading
@@ -64,7 +65,7 @@ class TraceStorage:
                 span_id INTEGER NOT NULL,
                 event_type TEXT NOT NULL CHECK(event_type IN ('start', 'end')),
                 timestamp TEXT NOT NULL,
-                sender TEXT NOT NULL CHECK(sender IN ('host', 'llm')),
+                sender TEXT NOT NULL CHECK(sender IN ('host', 'llm', 'tool')),
                 agent_id INTEGER NOT NULL,
                 parent_span_id INTEGER,
                 parent_span_id_known INTEGER NOT NULL DEFAULT 1,
@@ -134,6 +135,31 @@ class TraceStorage:
             """
         )
         self._connection.commit()
+        self._upgrade_tool_lane()
+
+    def _upgrade_tool_lane(self) -> None:
+        """SQLite cannot ALTER a CHECK constraint; copy atomically, preserving records/indexes."""
+        schema = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='events'"
+        ).fetchone()[0]
+        upgraded = re.sub(r"CHECK\s*\(\s*sender\s+IN\s*\(\s*'host'\s*,\s*'llm'\s*\)\s*\)",
+                          "CHECK(sender IN ('host', 'llm', 'tool'))", schema, flags=re.IGNORECASE)
+        if upgraded == schema:
+            return
+        indexes = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='events' AND sql IS NOT NULL"
+        ).fetchall()
+        columns = ', '.join('"' + row['name'] + '"' for row in self._connection.execute('PRAGMA table_info(events)'))
+        upgraded = re.sub(r'CREATE TABLE(?: IF NOT EXISTS)?\s+"?events"?',
+                          'CREATE TABLE events_tool_migration', upgraded, count=1, flags=re.IGNORECASE)
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(upgraded)
+            self._connection.execute(f"INSERT INTO events_tool_migration(rowid, {columns}) SELECT rowid, {columns} FROM events")
+            self._connection.execute("DROP TABLE events")
+            self._connection.execute("ALTER TABLE events_tool_migration RENAME TO events")
+            for index in indexes:
+                self._connection.execute(index[0])
 
     def put_events(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         stored: list[dict[str, Any]] = []
@@ -352,7 +378,7 @@ class TraceStorage:
               ON finish.trace_id=start.trace_id
              AND finish.span_id=start.span_id
              AND finish.event_type='end'
-            WHERE start.sender='host'
+            WHERE start.sender IN ('host', 'tool')
               AND start.event_type='start'
               AND start.timestamp <= ?
               AND finish.span_id IS NULL
@@ -768,7 +794,7 @@ def assemble_spans(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         lane = (int(span.get("agent_id") or 0), str(span.get("sender") or ""))
         previous = previous_by_lane.get(lane)
         next_started_at = span.get("started_at")
-        if previous is not None and previous["running"] and next_started_at:
+        if span.get("sender") != "tool" and previous is not None and previous["running"] and next_started_at:
             previous_started_at = previous.get("started_at")
             previous["ended_at"] = next_started_at
             previous["running"] = False

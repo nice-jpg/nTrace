@@ -697,6 +697,7 @@ function Timeline({ trace, selectedAgentId, selectedSpanId, onSelectAgent, onSel
         <div className="legend">
           <span><i className="legend-host" />Host runtime</span>
           <span><i className="legend-llm" />LLM call · depth = tokens</span>
+          <span><i className="legend-tool" />Tool execution</span>
         </div>
         <div className="timeline-actions">
           <span className="key-hint"><kbd>W</kbd><kbd>S</kbd> zoom · <kbd>A</kbd><kbd>D</kbd> move</span>
@@ -784,7 +785,7 @@ function AgentRows({ agent, layout, statsSelected, spans, startMs, timelineEndMs
           title={`${layout.collapsed ? 'Expand' : 'Collapse'} agent lanes`}
         ><Icon name="chevron" /></button>
       </div>
-      {!layout.collapsed && (['host', 'llm'] as const).map((sender) => (
+      {!layout.collapsed && (['host', 'llm', 'tool'] as const).map((sender) => (
         <div key={sender} className={`lane lane-${sender}`} style={{ left: LABEL_WIDTH, width: canvasWidth }}>
           <span className="lane-name">{sender}</span>
           {spans.filter((span) => span.sender === sender).map((span, spanIndex) => {
@@ -836,7 +837,7 @@ function ConnectorLayer({ rowLayouts, spans, connectors, startMs, pixelsPerMs, w
         const toLayout = layoutByAgent.get(span.agent_id)
         if (!fromLayout || !toLayout) return null
         const x = Math.max(4, (Date.parse(span.started_at) - startMs) * pixelsPerMs)
-        const fromY = fromLayout.top + (fromLayout.collapsed ? fromLayout.height / 2 : 27)
+        const fromY = fromLayout.top + (fromLayout.collapsed ? fromLayout.height / 2 : 27 + (parent?.sender === 'tool' ? 104 : parent?.sender === 'llm' ? 52 : 0))
         const toY = toLayout.top + (toLayout.collapsed ? toLayout.height / 2 : 27)
         return <path key={span.span_id} d={`M ${x} ${fromY} h 14 V ${toY} h 9`} />
       })}
@@ -1179,14 +1180,18 @@ function DetailDrawer({ span, loading, error, onLoadDetails, onClose }: {
         {span.sender === 'llm' && <Metric label="Weighted cost" value={tokenCost(span)?.toLocaleString() ?? '—'} />}
       </div>
       <div className="drawer-grid">
+        {span.sender === 'llm' && <>
         <JsonSection title="System prompt" value={span.system_prompt} wide loading={loading} error={error} onOpen={onLoadDetails} />
         <LazyUserInputsSection traceId={span.trace_id} spanId={span.span_id} />
         <JsonSection title="Output" value={span.output} loading={loading} error={error} onOpen={onLoadDetails} />
-        <JsonSection title="Tools" value={span.tools} loading={loading} error={error} onOpen={onLoadDetails} />
-        <JsonSection title="Tools called" value={span.tools_called} loading={loading} error={error} onOpen={onLoadDetails} />
-        {span.sender === 'host' && <JsonSection title="Tool call results" value={span.tool_call_results} loading={loading} error={error} onOpen={onLoadDetails} />}
         <TokenUsageSection usage={span.token_usage ?? {}} loading={loading} error={error} onOpen={onLoadDetails} />
-        <JsonSection title="Additional data" value={span.data} wide loading={loading} error={error} onOpen={onLoadDetails} />
+        </>}
+        {span.sender === 'host' && <JsonSection title="Agent state" value={span.data && typeof span.data === 'object' && 'state' in span.data ? span.data.state : span.data} wide loading={loading} error={error} onOpen={onLoadDetails} />}
+        {span.sender === 'tool' && <>
+          <JsonSection title="Tool arguments" value={span.tools_called} loading={loading} error={error} onOpen={onLoadDetails} />
+          <JsonSection title="Tool result" value={span.tool_call_results} loading={loading} error={error} onOpen={onLoadDetails} />
+        </>}
+        {span.sender !== 'host' && <JsonSection title="Execution status" value={span.data} loading={loading} error={error} onOpen={onLoadDetails} />}
       </div>
     </aside>
   )

@@ -78,7 +78,7 @@ class TraceEvent(BaseModel):
     parent_agent_id: int | None = Field(default=None, ge=1, le=MAX_SAFE_INTEGER)
     agent_name: str = Field(min_length=1, max_length=256)
     activation_order: int = Field(ge=1)
-    sender: Literal["host", "llm"]
+    sender: Literal["host", "llm", "tool"]
     type: Literal["start", "end"]
     timestamp: datetime
     system_prompt: Any = None

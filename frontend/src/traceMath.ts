@@ -8,7 +8,7 @@ import type {
 } from './types'
 
 export const LABEL_WIDTH = 188
-export const AGENT_HEIGHT = 104
+export const AGENT_HEIGHT = 156
 export const COLLAPSED_AGENT_HEIGHT = 40
 export const RULER_HEIGHT = 46
 
@@ -42,7 +42,12 @@ export function assembleSpans(events: TraceEvent[]): TraceSpan[] {
     const base = pair.end ?? pair.start
     if (!base) continue
     const start = pair.start ?? pair.end!
-    const merged = { ...start, ...(pair.end ?? {}) }
+    const endFields = Object.fromEntries(Object.entries(pair.end ?? {}).filter(([, value]) =>
+      value !== null && value !== undefined && value !== '' &&
+      !(Array.isArray(value) && value.length === 0) &&
+      !(typeof value === 'object' && Object.keys(value).length === 0),
+    ))
+    const merged = { ...start, ...endFields }
     const { type: _type, timestamp: _timestamp, ...fields } = merged
     const duration = pair.end
       ? Math.max(0, Date.parse(pair.end.timestamp) - Date.parse(start.timestamp))
@@ -64,7 +69,7 @@ export function assembleSpans(events: TraceEvent[]): TraceSpan[] {
   for (const span of spans) {
     const lane = `${span.agent_id}:${span.sender}`
     const previous = previousByLane.get(lane)
-    if (previous?.running) {
+    if (span.sender !== 'tool' && previous?.running) {
       const previousStart = Date.parse(previous.started_at)
       const nextStart = Date.parse(span.started_at)
       previous.ended_at = span.started_at
@@ -121,7 +126,7 @@ export function upsertTimelineSpan(spans: TraceSpan[], event: TraceEvent): Trace
   for (const span of next) {
     const lane = `${span.agent_id}:${span.sender}`
     const previous = previousByLane.get(lane)
-    if (previous?.running && span.started_at) {
+    if (span.sender !== 'tool' && previous?.running && span.started_at) {
       previous.ended_at = span.started_at
       previous.duration_ms = Math.max(0, Date.parse(span.started_at) - Date.parse(previous.started_at))
       previous.running = false

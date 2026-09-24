@@ -43,6 +43,13 @@ function event(type: 'start' | 'end', overrides: Partial<TraceEvent> = {}): Trac
 }
 
 describe('trace timeline math', () => {
+  it('keeps concurrent tools open in snapshot and live assembly', () => {
+    const first = event('start', { sender: 'tool', span_id: 40 })
+    const second = event('start', { sender: 'tool', span_id: 41, timestamp: '2026-01-01T00:00:01Z' })
+    expect(assembleSpans([first, second]).every((span) => span.running)).toBe(true)
+    const live = upsertTimelineSpan(upsertTimelineSpan([], first), second)
+    expect(live.every((span) => span.running)).toBe(true)
+  })
   it('assembles start and end events into a duration span', () => {
     const spans = assembleSpans([event('end', { output: 'done' }), event('start')])
     expect(spans).toHaveLength(1)
@@ -205,9 +212,9 @@ describe('trace timeline math', () => {
 
   it('compacts collapsed agent rows while preserving their layout position', () => {
     expect(layoutAgentRows([1, 2, 3], new Set([2]))).toEqual([
-      { agentId: 1, top: 0, height: 104, collapsed: false },
-      { agentId: 2, top: 104, height: 40, collapsed: true },
-      { agentId: 3, top: 144, height: 104, collapsed: false },
+      { agentId: 1, top: 0, height: 156, collapsed: false },
+      { agentId: 2, top: 156, height: 40, collapsed: true },
+      { agentId: 3, top: 196, height: 156, collapsed: false },
     ])
   })
 
