@@ -254,7 +254,7 @@ class HostTraceMiddleware(NTraceMiddleware):
 
 
 class ToolTraceMiddleware(NTraceMiddleware):
-    sender = "tool"
+    sender: str = "tool"
 
     def _start(self, request: ToolCallRequest) -> tuple[int, int | None]:
         self.trace.ensure_binding()

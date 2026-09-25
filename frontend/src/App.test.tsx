@@ -94,6 +94,7 @@ function llmTimelineSpan(base: TraceSpan, tokenUsage: Record<string, unknown>): 
 }
 
 afterEach(() => {
+  sessionStorage.clear()
   cleanup()
   vi.clearAllMocks()
 })
@@ -117,18 +118,18 @@ describe('trace input details', () => {
 
   it.each(['host', 'tool'] as const)('shows only relevant %s details and all three lanes', async (sender) => {
     const span = { ...timelineSpan({ spanId: 2, agentId: 1, parentAgentId: null, parentSpanId: null,
-      agentName: 'main', activationOrder: 1, second: 0 }), sender }
+      agentName: 'main', activationOrder: 1, second: 0 }), sender, tool_name: 'search', tool_error: sender === 'tool' }
     const detail: TraceDetail = {
       trace_id: 1, started_at: span.started_at, updated_at: span.started_at, status: 'running',
-      agent_count: 1, span_count: 1, events: [], spans: [span],
+      agent_count: 1, span_count: 2, events: [], spans: [span, { ...span, span_id: 3 }],
       agents: [{ agent_id: 1, parent_agent_id: null, agent_name: 'main', activation_order: 1, first_seen_at: span.started_at }],
     }
     vi.mocked(api.fetchTraces).mockResolvedValue([{ trace_id: 1 }])
     vi.mocked(api.fetchTrace).mockResolvedValue(detail)
-    vi.mocked(api.fetchSpan).mockResolvedValue(span)
+    vi.mocked(api.fetchSpan).mockImplementation(async (_trace, id) => ({ ...span, span_id: id }))
     const { container } = render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: '#1' }))
-    fireEvent.click(await screen.findByTitle(new RegExp(sender.toUpperCase())))
+    fireEvent.click((await screen.findAllByTitle(new RegExp(sender.toUpperCase())))[0])
     expect(container.querySelectorAll('.lane')).toHaveLength(3)
     expect(screen.queryByText('System prompt')).not.toBeInTheDocument()
     expect(screen.queryByText(/^User inputs/)).not.toBeInTheDocument()
@@ -139,7 +140,16 @@ describe('trace input details', () => {
       expect(screen.getByText('Tool arguments')).toBeInTheDocument()
       expect(screen.getByText('Tool result')).toBeInTheDocument()
       expect(screen.queryByText('Agent state')).not.toBeInTheDocument()
+      expect(container.querySelectorAll('.trace-block.tool.tool-error')).toHaveLength(2)
+      expect(container.querySelector('.trace-block.tool .block-order')).not.toBeInTheDocument()
+      expect(container.querySelector('.trace-block.tool .block-title')).toHaveTextContent('search')
     }
+    const field = sender === 'host' ? 'Agent state' : 'Tool arguments'
+    fireEvent.click(screen.getByText(field))
+    await waitFor(() => expect(sessionStorage.getItem(`ntrace:details:${sender}:${field}`)).toBe('true'))
+    fireEvent.click((await screen.findAllByTitle(new RegExp(sender.toUpperCase())))[1])
+    await waitFor(() => expect(screen.getByText(field).closest('details')).toHaveAttribute('open'))
+    expect(sessionStorage.getItem(`ntrace:details:llm:${field}`)).toBeNull()
   })
 
   it('places the expanded detail drawer after the timeline so it consumes workspace height', async () => {
@@ -259,6 +269,13 @@ describe('trace input details', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close details' }))
     expect(container.querySelector('.detail-drawer')).not.toBeInTheDocument()
     expect(workspace).not.toHaveClass('detail-open')
+
+    vi.mocked(api.fetchUserInputs).mockResolvedValue({ items: ['restored'], offset: 0, limit: 10, total: 1, has_more: false })
+    fireEvent.click(await screen.findByTitle(/LLM/))
+    await waitFor(() => expect(api.fetchUserInputs).toHaveBeenLastCalledWith(1, 2, 0, 10))
+    await waitFor(() => expect(screen.getByText(/^User inputs/).closest('details')).toHaveAttribute('open'))
+    expect(await screen.findByText('restored')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Close details' }))
 
     fireEvent.click(screen.getByRole('button', { name: 'Collapse agent main' }))
     expect(container.querySelector('.agent-row')).toHaveClass('collapsed')

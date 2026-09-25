@@ -11,6 +11,8 @@ export interface TraceEvent {
   agent_name: string
   activation_order: number
   sender: Sender
+  tool_name?: string
+  tool_error?: boolean
   type: EventType
   timestamp: string
   system_prompt?: unknown

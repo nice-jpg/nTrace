@@ -89,6 +89,7 @@ button, summary { -webkit-tap-highlight-color: transparent; }
 .legend-llm { background: var(--purple); }
 .legend-tool { background: #d89132; }
 .trace-block.tool { background: #986320; }
+.trace-block.tool.tool-error { background: #b42336; border-color: #ff7685; }
 .sender-chip.tool { color: #ffd38c; background: rgba(216,145,50,.16); }
 .timeline-actions { display: flex; align-items: center; gap: 4px; }
 .timeline-actions button { height: 27px; min-width: 28px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; color: #90a2ba; background: #0b1727; cursor: pointer; font-size: 10px; }

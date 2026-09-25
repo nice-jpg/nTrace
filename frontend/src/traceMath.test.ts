@@ -43,6 +43,13 @@ function event(type: 'start' | 'end', overrides: Partial<TraceEvent> = {}): Trac
 }
 
 describe('trace timeline math', () => {
+  it('preserves tool names when the end event only supplies an error', () => {
+    const first = event('start', { sender: 'tool', tool_name: 'search' })
+    const last = event('end', { sender: 'tool', tool_name: '', tool_error: true })
+    const span = upsertTimelineSpan(upsertTimelineSpan([], first), last)[0]
+    expect(span.tool_name).toBe('search')
+    expect(span.tool_error).toBe(true)
+  })
   it('keeps concurrent tools open in snapshot and live assembly', () => {
     const first = event('start', { sender: 'tool', span_id: 40 })
     const second = event('start', { sender: 'tool', span_id: 41, timestamp: '2026-01-01T00:00:01Z' })

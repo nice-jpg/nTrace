@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import gzip
 import io
+import logging
 import os
 from pathlib import Path
 from typing import Any, Literal
@@ -28,6 +29,7 @@ from .snapshots import MissingSnapshot
 DEFAULT_DATABASE = Path(__file__).resolve().parent / "data" / "ntrace.sqlite3"
 DEFAULT_STATIC = Path(__file__).resolve().parent / "frontend" / "dist"
 MAX_EVENT_BODY_BYTES = 64 * 1024 * 1024
+RETENTION_INTERVAL_SECONDS = 60
 
 
 class EventRequest(Request):
@@ -159,10 +161,31 @@ def create_app(
     storage = TraceStorage(database_path or os.getenv("NTRACE_DATABASE_PATH") or DEFAULT_DATABASE)
     stream = StreamHub()
 
+    async def clean_expired() -> None:
+        try:
+            for trace_id in await asyncio.to_thread(storage.prune_expired):
+                await stream.broadcast({"kind": "trace.deleted", "trace_id": trace_id})
+        except Exception:
+            logging.getLogger("nTrace.server").exception("Expired trace cleanup failed")
+
+    async def maintenance(stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=RETENTION_INTERVAL_SECONDS)
+            except asyncio.TimeoutError:
+                await clean_expired()
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        yield
-        storage.close()
+        await clean_expired()
+        stop = asyncio.Event()
+        task = asyncio.create_task(maintenance(stop))
+        try:
+            yield
+        finally:
+            stop.set()
+            await task
+            storage.close()
 
     app = FastAPI(title="nTrace", version="1.0.0", lifespan=lifespan)
     app.state.storage = storage
@@ -326,6 +349,8 @@ def _timeline_event(event: dict[str, Any]) -> dict[str, Any]:
         "sender",
         "type",
         "timestamp",
+        "tool_name",
+        "tool_error",
     )
     return {field: event.get(field) for field in fields}
 

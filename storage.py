@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import json
 import re
 from pathlib import Path
@@ -12,6 +12,20 @@ import threading
 from typing import Any
 
 from .snapshots import MissingSnapshot, digest, encode_events, resolve_event
+
+
+def tool_display(event: dict[str, Any]) -> dict[str, Any]:
+    if event.get("sender") != "tool":
+        return {}
+    calls = event.get("tools_called") or []
+    data = event.get("data") or {}
+    results = event.get("tool_call_results") or []
+    failed = isinstance(data, dict) and bool(data.get("error_type") or data.get("error"))
+    failed = failed or any(isinstance(result, dict) and (
+        result.get("status") == "error" or result.get("is_error") is True
+    ) for result in results)
+    name = next((call.get("name") for call in calls if isinstance(call, dict) and call.get("name")), "")
+    return {"tool_name": name, "tool_error": bool(failed)}
 
 
 class TraceStorage:
@@ -96,6 +110,8 @@ class TraceStorage:
         }
         if "parent_span_id" not in columns:
             self._connection.execute("ALTER TABLE events ADD COLUMN parent_span_id INTEGER")
+        if "tool_display_json" not in columns:
+            self._connection.execute("ALTER TABLE events ADD COLUMN tool_display_json TEXT")
         if "parent_span_id_known" not in columns:
             self._connection.execute(
                 "ALTER TABLE events ADD COLUMN parent_span_id_known INTEGER NOT NULL DEFAULT 0"
@@ -166,6 +182,7 @@ class TraceStorage:
         with self._lock, self._connection:
             for raw_event in events:
                 event = self._contextualize_event(raw_event)
+                event.update(tool_display(event))
                 trace_id = int(event["trace_id"])
                 timestamp = str(event["timestamp"])
                 self._connection.execute(
@@ -228,8 +245,8 @@ class TraceStorage:
                     INSERT INTO events(
                         trace_id, span_id, event_type, timestamp, sender, agent_id,
                         parent_span_id, parent_span_id_known,
-                        token_usage_json, token_usage_known, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?)
+                        token_usage_json, token_usage_known, payload_json, tool_display_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?)
                     ON CONFLICT(trace_id, span_id, event_type) DO NOTHING
                     """,
                     (
@@ -242,6 +259,7 @@ class TraceStorage:
                         event.get("parent_span_id"),
                         json.dumps(event.get("token_usage") or {}, ensure_ascii=False, separators=(",", ":")),
                         json.dumps({**encoded[0], "_snapshot_version": 1}, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(tool_display(event)),
                     ),
                 )
                 if cursor.rowcount:
@@ -512,6 +530,17 @@ class TraceStorage:
             ).fetchone()
             if trace is None:
                 return None
+            # Older tool events get their tiny display metadata once, without loading other context.
+            legacy = self._connection.execute(
+                "SELECT rowid, payload_json FROM events WHERE trace_id=? AND sender='tool' AND tool_display_json IS NULL",
+                (trace_id,),
+            ).fetchall()
+            if legacy:
+                with self._connection:
+                    for row in legacy:
+                        payload = self._read_payload(row["payload_json"], ("sender", "tools_called", "tool_call_results", "data"))
+                        self._connection.execute("UPDATE events SET tool_display_json=? WHERE rowid=?",
+                                                 (json.dumps(tool_display(payload)), row["rowid"]))
             agent_rows = self._connection.execute(
                 """
                 SELECT agent_id, parent_agent_id, agent_name, activation_order, first_seen_at
@@ -522,7 +551,7 @@ class TraceStorage:
             event_rows = self._connection.execute(
                 """
                 SELECT trace_id, span_id, event_type, timestamp, sender, agent_id,
-                       parent_span_id
+                       parent_span_id, tool_display_json
                 FROM events
                 WHERE trace_id=?
                 ORDER BY timestamp, event_type DESC
@@ -548,6 +577,7 @@ class TraceStorage:
                     "sender": row["sender"],
                     "type": row["event_type"],
                     "timestamp": row["timestamp"],
+                    **json.loads(row["tool_display_json"] or "{}"),
                 }
             )
         spans = assemble_spans(events)
@@ -555,6 +585,7 @@ class TraceStorage:
             "schema_version", "trace_id", "span_id", "parent_span_id",
             "agent_id", "parent_agent_id", "agent_name", "activation_order",
             "sender", "type", "started_at", "ended_at", "duration_ms", "running",
+            "tool_name", "tool_error",
         )
         return {
             **dict(trace),
@@ -734,6 +765,21 @@ class TraceStorage:
             "total": len(inputs),
             "has_more": start + len(items) < len(inputs),
         }
+
+    def prune_expired(self, *, now: datetime | None = None, limit: int = 100) -> list[int]:
+        cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=3)).isoformat()
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                "SELECT trace_id FROM traces WHERE favorite=0 AND julianday(started_at) <= julianday(?) ORDER BY started_at LIMIT ?",
+                (cutoff, limit),
+            ).fetchall()
+            ids = [int(row[0]) for row in rows]
+            for trace_id in ids:
+                self._connection.execute("DELETE FROM traces WHERE trace_id=?", (trace_id,))
+                self._connection.execute("DELETE FROM trace_contexts WHERE root_trace_id=? OR source_trace_id=?", (trace_id, trace_id))
+            if ids:
+                self._connection.execute("DELETE FROM snapshots WHERE snapshot_id NOT IN (SELECT snapshot_id FROM trace_snapshots)")
+            return ids
 
     def delete_trace(self, trace_id: int) -> bool:
         with self._lock, self._connection:

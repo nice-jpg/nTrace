@@ -116,6 +116,25 @@ timeline uses `GET /api/v1/traces/{trace_id}/timeline`. Non-input span details l
 newest-first through `GET /api/v1/traces/{trace_id}/spans/{span_id}/user-inputs`.
 Live updates use `WS /api/v1/stream`.
 
+## Retention and detail preferences
+
+Unfavorited traces expire 72 hours after `started_at` (UTC), not after their latest
+event. The service checks on startup and every minute, removing up to 100 expired
+traces per pass. Favorites are exempt; removing a favorite makes an already-expired
+trace eligible at the next pass. Deletion removes agents/events/context mappings and
+unreferenced snapshots, preserving snapshots shared by remaining traces. Connected
+pages receive `trace.deleted`. Back up any older history you want to keep before
+deploying this policy, or mark it as a favorite. Cleanup does not run VACUUM or
+promise immediate physical shrinking of the SQLite file; freed pages are reusable.
+
+Detail expansion preferences are stored in browser session storage, independently
+for host/LLM/tool fields. Switching spans restores those preferences, loading only
+the restored open sections (inputs still use newest-first pagination). Tool blocks
+show names instead of sequence numbers and turn red on exceptions or error-status
+tool results. Names/error flags travel in lightweight timeline/stream metadata,
+without loading tool arguments or result contents. Older tool metadata is cached
+on its first timeline read.
+
 ## Incremental context snapshots and images
 
 The SDK sends context through `POST /api/v1/snapshot-events`, using a versioned

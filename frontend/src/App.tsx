@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import type { EChartsOption } from 'echarts'
 import {
@@ -797,16 +797,16 @@ function AgentRows({ agent, layout, statsSelected, spans, startMs, timelineEndMs
               <button
                 key={span.span_id}
                 data-span-id={span.span_id}
-                className={`trace-block ${sender} ${span.running ? 'running' : ''} ${selectedSpanId === span.span_id ? 'selected' : ''}`}
+                className={`trace-block ${sender} ${span.tool_error ? 'tool-error' : ''} ${span.running ? 'running' : ''} ${selectedSpanId === span.span_id ? 'selected' : ''}`}
                 style={{
                   left: layout.left,
                   width: layout.width,
                   background: sender === 'llm' ? tokenColor(cost) : undefined,
                 }}
                 onClick={() => onSelectSpan(span)}
-                title={`#${order} · ${sender.toUpperCase()} · ${formatPreciseTime(span.started_at)} · ${formatDuration(span.duration_ms)}`}
+                title={`${sender === 'tool' ? span.tool_name || 'Tool' : `#${order}`} · ${sender.toUpperCase()} · ${formatPreciseTime(span.started_at)} · ${formatDuration(span.duration_ms)}`}
               >
-                <span className="block-order">#{String(order).padStart(2, '0')}</span>
+                {sender === 'tool' ? <span className="block-title">{span.tool_name || 'Tool'}</span> : <span className="block-order">#{String(order).padStart(2, '0')}</span>}
                 {sender === 'llm' && <span className="block-title">{llmLabel(span)}</span>}
                 <span className="block-duration">{formatDuration(span.duration_ms)}</span>
                 {layout.clipped && <b className="clip-mark">//</b>}
@@ -1179,7 +1179,7 @@ function DetailDrawer({ span, loading, error, onLoadDetails, onClose }: {
         <Metric label="Status" value={span.running ? 'Running' : 'Complete'} />
         {span.sender === 'llm' && <Metric label="Weighted cost" value={tokenCost(span)?.toLocaleString() ?? '—'} />}
       </div>
-      <div className="drawer-grid">
+      <DisclosureType.Provider value={span.sender}><div className="drawer-grid">
         {span.sender === 'llm' && <>
         <JsonSection title="System prompt" value={span.system_prompt} wide loading={loading} error={error} onOpen={onLoadDetails} />
         <LazyUserInputsSection traceId={span.trace_id} spanId={span.span_id} />
@@ -1192,7 +1192,7 @@ function DetailDrawer({ span, loading, error, onLoadDetails, onClose }: {
           <JsonSection title="Tool result" value={span.tool_call_results} loading={loading} error={error} onOpen={onLoadDetails} />
         </>}
         {span.sender !== 'host' && <JsonSection title="Execution status" value={span.data} loading={loading} error={error} onOpen={onLoadDetails} />}
-      </div>
+      </div></DisclosureType.Provider>
     </aside>
   )
 }
@@ -1217,8 +1217,25 @@ export function UserInputsSection({ inputs, defaultOpen = false }: { inputs: unk
   )
 }
 
+const DisclosureType = createContext('host')
+
+function useRememberedDisclosure(field: string, onOpen: () => void): [boolean, (value: boolean) => void] {
+  const sender = useContext(DisclosureType)
+  const key = `ntrace:details:${sender}:${field}`
+  const [open, updateOpen] = useState(() => {
+    try { return sessionStorage.getItem(key) === 'true' } catch { return false }
+  })
+  const callback = useRef(onOpen)
+  callback.current = onOpen
+  useEffect(() => { if (open) callback.current() }, [open])
+  const setOpen = (value: boolean) => {
+    updateOpen(value)
+    try { sessionStorage.setItem(key, String(value)) } catch { /* Storage may be disabled. */ }
+  }
+  return [open, setOpen]
+}
+
 function LazyUserInputsSection({ traceId, spanId }: { traceId: number; spanId: number }) {
-  const [open, setOpen] = useState(false)
   const [inputs, setInputs] = useState<unknown[]>([])
   const [total, setTotal] = useState<number | null>(null)
   const [hasMore, setHasMore] = useState(true)
@@ -1243,6 +1260,9 @@ function LazyUserInputsSection({ traceId, spanId }: { traceId: number; spanId: n
       setLoading(false)
     }
   }, [hasMore, inputs.length, spanId, traceId])
+  const [open, setOpen] = useRememberedDisclosure('User inputs', () => {
+    if (total === null) void loadMore()
+  })
 
   return (
     <details
@@ -1251,7 +1271,6 @@ function LazyUserInputsSection({ traceId, spanId }: { traceId: number; spanId: n
       onToggle={(event) => {
         const nextOpen = event.currentTarget.open
         setOpen(nextOpen)
-        if (nextOpen && total === null) void loadMore()
       }}
     >
       <summary>User inputs {total !== null && <span>{total}</span>}</summary>
@@ -1325,7 +1344,7 @@ function TokenUsageSection({ usage, loading, error, onOpen }: {
   error: string
   onOpen: () => void
 }) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useRememberedDisclosure('Token usage', onOpen)
   const cost = tokenCostBreakdown(usage)
   return (
     <details
@@ -1333,7 +1352,6 @@ function TokenUsageSection({ usage, loading, error, onOpen }: {
       open={open}
       onToggle={(event) => {
         setOpen(event.currentTarget.open)
-        if (event.currentTarget.open) onOpen()
       }}
     >
       <summary>Token usage</summary>
@@ -1363,13 +1381,12 @@ function JsonSection({ title, value, wide = false, loading, error, onOpen }: {
   error: string
   onOpen: () => void
 }) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useRememberedDisclosure(title, onOpen)
   return <details
     className={wide ? 'wide' : ''}
     open={open}
     onToggle={(event) => {
       setOpen(event.currentTarget.open)
-      if (event.currentTarget.open) onOpen()
     }}
   >
     <summary>{title}</summary>

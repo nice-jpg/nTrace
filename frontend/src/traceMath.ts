@@ -111,6 +111,8 @@ export function upsertTimelineSpan(spans: TraceSpan[], event: TraceEvent): Trace
   const updated: TraceSpan = {
     ...(existing ?? identity),
     ...identity,
+    tool_name: event.tool_name || existing?.tool_name,
+    tool_error: Boolean(event.tool_error || existing?.tool_error),
     type: 'span',
     started_at: startedAt,
     ended_at: endedAt,
